@@ -2,7 +2,7 @@
 
 这是 `JasonZHANGTianrui/verl` fork 中的具身训练实现，包含 SegGRPO 分组、
 原生 G0.5 采样与概率计算、工具循环，以及单组／多卡更新诊断。
-完整 verl Ray/FSDP Trainer 和持续训练循环仍待接入。
+已增加原生后端的连续训练与组边界恢复；完整 verl Ray/FSDP Trainer 仍待接入。
 
 ## 目录职责
 
@@ -14,6 +14,7 @@
 | `g05_logprobs.py`、`precision.py` | 动作／文字概率与FP32参考路径 |
 | `native_update.py` | 原生模型的单组SGD更新诊断 |
 | `pilot.py`、`distributed_update.py` | 真实4＋4小组、跨区采样附件核验及更新入口 |
+| `train.py`、`training_state.py` | 原生后端连续训练、全局梯度、组边界保存/恢复及verl日志 |
 | `workspace.py` | 定位独立的Physical AI工作区，不靠submodule目录层数 |
 | `configs/` | 本接入的loop、奖励契约和开发case配置 |
 
@@ -60,6 +61,58 @@ torchrun --standalone --nproc_per_node=2 --module verl.experimental.physical_ai.
 
 `--update`执行一次内存内无动量SGD诊断，不覆盖源权重，没有生产优化器状态或训练
 checkpoint恢复。数据任务表的动作奖励绑定、生产loop读取与连续训练仍需继续接入。
+
+## 使用SFT派生任务做一次真实更新
+
+`pilot`现可通过`--task-release`和`--task-id`读取数据侧导出的任务，恢复源XML与
+states[0]，逐控制步复用完整SceneCapture，再沿同一原生会话交付原题。未来问题、
+旧SFT回答/think/动作与成功标签都不作为初始输入；新GT从本次执行提取。
+
+```bash
+python -m verl.experimental.physical_ai.pilot \
+  --bundle /path/to/g05-bundle --checkpoint /path/to/step_1000.pt \
+  --case training-pipeline/ours/rl/verl/experimental/physical_ai/configs/sft-task-pilot.json \
+  --task-release /path/to/exported-rl-tasks --task-id 'libero-rl/<id>' \
+  --output /path/to/new-run --update --save-checkpoint
+```
+
+首版配置只绑定“打开中间抽屉”的已校准设备状态奖励；它与QA所问内容分开计算，
+不是把QA答案或原生success当动作奖励。换其他任务须另行绑定规则，不能把这一个
+case已接通解释成整个2000条已可训练。任务表的pending字段继续保留。
+
+小试固定4条动作＋从中均匀选一父轨迹的4条QA，同一行为权重全部采完后才更新。
+动作/QA预算分别128/32个20Hz控制步，各6144个新token；全图/动作/文字历史保留。
+API错误或未知GT阻止整组更新；全同分组优势为0，不重采制造分差。
+
+`--save-checkpoint`只在实际更新后保存外层policy完整原生state_dict到独立
+`checkpoints/step_1.pt`，兼容原加载接口。该文件明确标记为单步SGD诊断，未保存
+生产优化器/调度器/采样器恢复状态；不冒称完整verl Trainer checkpoint。
+
+## 连续训练与SwanLab
+
+`train`复用`pilot.collect_group`和`native_update.update_once`，没有另一份模型生成或
+奖励实现。当前profile使用FP32、持久SGD、归约后全局梯度裁剪；采集在rank0串行完成，
+所有rank按响应分片重算策略梯度。它是fork中的原生PyTorch分布式接入，不是Ray/FSDP
+或vLLM后端，采样吞吐尚未优化。第一阶段仅启用已绑定设备状态奖励的训练任务。
+
+```bash
+python -m torch.distributed.run --standalone --nproc_per_node=2 \
+  --module verl.experimental.physical_ai.train \
+  --bundle /path/to/bundle --checkpoint /path/to/step_1000.pt \
+  --task-release /path/to/rl-tasks \
+  --config training-pipeline/ours/rl/verl/experimental/physical_ai/configs/sft-task-stage1.json \
+  --swanlab-key-file /path/to/private/key.txt --output /path/to/new-training-run
+```
+
+每组完成后保存完整policy、优化器、训练游标、数据/配置身份及各rank随机状态。
+`--resume /path/to/checkpoints/group-N/checkpoint.json`配合新output目录恢复；改变任务、
+配置或world size会拒绝。半组不能续接成旧物理经历，旧attempt目录保留，重新采样
+使用新目录。checkpoint先原子落盘并hash，最后写manifest，不接受半份文件。
+
+SwanLab走verl原生`Tracking`；密钥只从私有文件进入进程环境，不写配置和checkpoint。
+只上报动作/QA奖励、有效更新数、零方差组、概率误差、梯度范数和耗时，不上传私有
+轨迹或GT。`swanlab.json`给出云端入口，`progress.json`与逐group日志保留本地进度。
+此profile未加reference KL；全部同分的组仍为零优势，不能据此重采制造奖励差异。
 
 ## 检查
 

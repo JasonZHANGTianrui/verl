@@ -20,10 +20,11 @@ import unittest
 from types import SimpleNamespace
 
 import numpy as np
-from benchmark.core.scene_graph import canonical
+from benchmark.core.scene_graph import SceneRecorder, canonical
 from benchmark.scoring.llm_judge import JudgeAPIError
 
 from verl.experimental.physical_ai.online_reward import public_text, score_answer
+from verl.experimental.physical_ai.task_data import state_task_reward
 
 
 def binding():
@@ -65,6 +66,41 @@ class _UncopyableSim:
 
 class OnlineRewardTests(unittest.TestCase):
     """GT来源、裁判错误和物理副本的核心隔离检查。"""
+
+    def test_task_reward_is_independent_of_qa_and_old_result(self):
+        """QA可以问数量，动作仍按当前设备状态计分；缺状态或错任务不能填零。"""
+        task = dict(
+            environment=dict(task_name="open_drawer"), followup=dict(answer=999), outcome=dict(task_success=True)
+        )
+        rule = dict(
+            version="rl-device-state-goal-v1",
+            task_name="open_drawer",
+            calibration="cal-v1",
+            query=dict(op="attribute", entity="drawer", path="states.opening.value"),
+            allowed_states=["open", "closed", "partially_open"],
+            target_state="open",
+        )
+        reader = SimpleNamespace(config=dict(version="cal-v1"))
+        for state, expected in [("open", 1.0), ("closed", 0.0), (None, None)]:
+            recorder = SceneRecorder("actual-run", max_gap_s=0.1)
+            recorder.observe(
+                dict(
+                    step=0,
+                    time_s=0.0,
+                    versions={},
+                    coverage={},
+                    relations=[],
+                    nodes={"drawer": dict(id="drawer", kind="object", states=dict(opening=dict(value=state)))},
+                )
+            )
+            if expected is None:
+                with self.assertRaises(ValueError):
+                    state_task_reward(task, rule, reader, recorder)
+            else:
+                self.assertEqual(state_task_reward(task, rule, reader, recorder)["task_reward"], expected)
+        task["environment"]["task_name"] = "other_task"
+        with self.assertRaises(ValueError):
+            state_task_reward(task, rule, reader, recorder)
 
     def test_runtime_clone_rebinds_controller_methods(self):
         """等待流程留下的实例绑定方法应指向子控制器，不递归复制或改动父sim。"""

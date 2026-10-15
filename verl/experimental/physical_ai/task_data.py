@@ -22,6 +22,52 @@ from ours.rl.tasks import load_initial, resolve_resource
 from .libero_session import LiberoSession
 
 
+def load_task_release(release, task_id):
+    """读取显式指定的训练任务并核验发布文件SHA，不按旧答案或执行分数选题。
+
+    返回私有任务及资源索引；模型只能通过既有会话构造器读取instruction和真实观察。
+    导出的待绑定奖励字段不等于可训练，调用方仍须绑定、记录独立任务奖励规则。
+    """
+    from ours.sft.shared.resources import sha256
+
+    release = Path(release).resolve(strict=True)
+    manifest = json.loads((release / "manifest.json").read_text())
+    for name in ("train.jsonl", "resources.json"):
+        if sha256(release / name) != manifest["files"][name]:
+            raise ValueError("RL发布文件内容变化：" + name)
+    rows = [json.loads(line) for line in (release / "train.jsonl").read_text().splitlines() if line.strip()]
+    matches = [row for row in rows if row["id"] == task_id]
+    if len(matches) != 1 or matches[0]["split"] != "train":
+        raise ValueError("需要唯一的已导出训练任务ID")
+    resources = json.loads((release / "resources.json").read_text())["entries"]
+    return matches[0], resources
+
+
+def state_task_reward(task, rule, reader, recorder):
+    """按显式设备状态目标计算0/1动作奖励，和QA问题/旧SFT结果完全分离。
+
+    当前只接已校准状态目标；任务名称、规则版本及语义图版本须完全匹配。
+    query使用冻结图中的英文语义状态，不读qpos自行设阈值、不用native success兜底。
+    未知或无效枚举阻止整个组更新；返回完整私有事实供审计。
+    """
+    from benchmark.libero.questions.selection import query_fact
+
+    if (
+        rule["version"] != "rl-device-state-goal-v1"
+        or task["environment"]["task_name"] != rule["task_name"]
+        or reader.config["version"] != rule["calibration"]
+        or rule["query"]["op"] != "attribute"
+        or not rule["query"]["path"].startswith("states.")
+    ):
+        raise ValueError("任务奖励绑定或状态校准版本不符")
+    fact = query_fact(recorder.freeze("rl-task-reward"), rule["query"])
+    if fact.status != "ok" or fact.value not in rule["allowed_states"]:
+        raise ValueError("任务状态未知或不在冻结枚举内，不能填0")
+    if rule["target_state"] not in rule["allowed_states"]:
+        raise ValueError("任务目标状态不在冻结枚举内")
+    return dict(task_reward=float(fact.value == rule["target_state"]), state=fact.value, rule=rule)
+
+
 def open_task_session(task, resources, *, seed, max_steps, resolution=256):
     """按源训练初态创建独立会话，预算来自RL运行配置而非示范长度。
 

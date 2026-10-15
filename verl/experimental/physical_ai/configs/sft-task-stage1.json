@@ -1,0 +1,42 @@
+{
+  "schema": "physical-ai.seggrpo-training-config.v1",
+  "split": "train",
+  "environment_seed": 42,
+  "seed": 42,
+  "execution_group_size": 4,
+  "qa_group_size": 4,
+  "execution_steps": 128,
+  "qa_steps": 32,
+  "execution_token_budget": 6144,
+  "qa_token_budget": 6144,
+  "judge_model": "gpt-5.6-sol",
+  "task_rule": {
+    "version": "rl-device-state-goal-v1",
+    "target_state": "open",
+    "calibration": "libero-scene-map-draft-2+asset-supports-v1",
+    "native_success_is_diagnostic_only": true,
+    "task_name": "open_the_middle_drawer_of_the_cabinet",
+    "query": {
+      "op": "attribute",
+      "entity": "wooden_cabinet_1/wooden_cabinet_1_cabinet_middle",
+      "path": "states.wooden_cabinet_1_middle_level.value"
+    },
+    "allowed_states": [
+      "open",
+      "closed",
+      "partially_open"
+    ]
+  },
+  "sampling_mode": "recompute",
+  "compute_dtype": "float32",
+  "max_groups": 8,
+  "optimizer": "sgd",
+  "learning_rate": 0.0001,
+  "max_grad_norm": 1.0,
+  "project": "physical-ai-rl",
+  "experiment": "reactpi-epoch20-seggrpo-drawer-stage1",
+  "logger": [
+    "console",
+    "swanlab"
+  ]
+}

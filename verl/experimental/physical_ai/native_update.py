@@ -35,6 +35,8 @@ def update_once(
     max_logprob_error=0.05,
     compute_dtype="bfloat16",
     distributed=False,
+    optimizer=None,
+    max_grad_norm=None,
 ):
     """收齐组后逐条重算、累积两阶段GRPO梯度，执行一次无动量SGD并记录真实变化。
 
@@ -42,6 +44,8 @@ def update_once(
     使用SGD仅为32GB单卡的无优化器状态诊断；不定义正式训练优化器，不改原checkpoint。
     distributed=True时按全局行号分片，优势仍在完整组计算；更新前SUM所有卡梯度，
     不重复除以卡数。所有生成mask来自rollout，父轨迹在QA行仅作前缀；zero-advantage整组明确跳过更新。
+    连续训练可传持久optimizer，更新公式保持不变；max_grad_norm在全局归约后统一裁剪。
+    不传optimizer仍沿用旧单步SGD诊断，不能将每轮重新创建的有状态优化器冒称恢复。
     """
     from generate import no_cache_hidden
     from memory import checkpoint_linear_layers
@@ -79,7 +83,9 @@ def update_once(
     model.train()
     model.vlm.gradient_checkpointing_enable()
     model.vision_tower.gradient_checkpointing_enable()
-    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
+    diagnostic = optimizer is None
+    if optimizer is None:
+        optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats()
     rows = []
@@ -140,16 +146,22 @@ def update_once(
     name, param = representative
     index = int(param.grad.abs().flatten().argmax())
     before = float(param.detach().flatten()[index])
+    grad_norm = None
+    if max_grad_norm is not None:
+        if max_grad_norm <= 0:
+            raise ValueError("梯度裁剪上限必须为正")
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, error_if_nonfinite=True))
     optimizer.step()
     after = float(param.detach().flatten()[index])
     result = dict(
         status="updated",
         optimizer_step=True,
-        optimizer="SGD diagnostic, no momentum",
+        optimizer="SGD diagnostic, no momentum" if diagnostic else type(optimizer).__name__,
         distributed_world_size=world_size,
         rank=rank,
         gradient_reduction="sum_global_normalized_losses",
         learning_rate=learning_rate,
+        grad_norm_before_clip=grad_norm,
         parameters_with_grad=len(norms),
         nonzero_gradient_parameters=sum(n > 0 for n in norms),
         representative=dict(parameter=name, index=index, before=before, after=after),

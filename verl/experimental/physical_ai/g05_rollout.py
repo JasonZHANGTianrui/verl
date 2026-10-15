@@ -50,6 +50,7 @@ def collect_phase(
     old_logprobs=None,
     recorder=None,
     reader=None,
+    scene_capture=None,
 ):
     """采集一个阶段并保存全部原始生成ID与概率，工具观察不标成策略输出。
 
@@ -178,7 +179,9 @@ def collect_phase(
                 session.steps += 1
                 session.last_action = action.copy()
                 session.action_history.append(dict(step=session.steps, mode=mode, action=action.tolist()))
-                if recorder is not None:
+                if scene_capture is not None:
+                    scene_capture.observe(session.steps)
+                elif recorder is not None:
                     recorder.observe(reader.read(session.steps))
                 video.append_data(extract_libero_images(session.observation)["image"])
 

@@ -28,6 +28,205 @@ from .workspace import configure_workspace
 ROOT = configure_workspace()
 
 
+def collect_group(policy, processor, config, output, *, policy_version, task=None, resources=None):
+    """采集同版策略的完整动作/QA组；小试与连续训练共用同一会话和评分实现。
+
+    output为新的组目录，config已绑定一道训练任务/原问题与独立动作奖励。
+    每个控制步采集真实图；均匀选择父经历后建立独立QA环境副本。返回Segment及
+    原始token/mask/概率附件索引；未知GT或judge错误整组抛错，不丢样本缩组。
+    """
+    from benchmark.adapters.libero_scene_map import LiberoSceneMap
+    from benchmark.core.scene_graph import SceneRecorder
+    from benchmark.scoring.llm_judge import JudgeClient
+    from experiments.libero.libero_eval_utils import build_libero_raw_obs
+    from libero.libero import benchmark
+    from rollout.g05.chat_libero import LiveChat
+
+    from .g05_rollout import chat_fingerprint, collect_phase
+    from .libero_session import LiberoSession
+    from .online_reward import bind_delivery, save_json, score_answer
+    from .sampling import fork_chat
+    from .seggrpo import Segment, select_parent
+    from .task_data import create_scene_capture, open_task_session, state_task_reward
+
+    question = config["question"]
+    task_index = None
+    if task is None:
+        suite = benchmark.get_benchmark_dict()[config["suite"]]()
+        task_index = next(i for i in range(suite.n_tasks) if suite.get_task(i).name == config["task_name"])
+    records, artifacts, parents = [], [], []
+    # 所有父环境保留到选中一个，再为每条QA建立独立副本；退出后统一释放再训练。
+    with ExitStack() as stack:
+        initial_digest = None
+        for i in range(config["execution_group_size"]):
+            rollout_id = f"execution-{i}"
+            session = stack.enter_context(
+                open_task_session(
+                    task,
+                    resources,
+                    seed=config["environment_seed"],
+                    max_steps=config["execution_steps"] + config["qa_steps"],
+                )
+                if task is not None
+                else LiberoSession(
+                    config["suite"],
+                    task_index,
+                    initial_state_index=config["initial_state_index"],
+                    seed=config["environment_seed"],
+                    max_steps=config["execution_steps"] + config["qa_steps"],
+                )
+            )
+            capture = (
+                create_scene_capture(session, task, resources, output / "scene" / rollout_id, rollout_id=rollout_id)
+                if task is not None
+                else None
+            )
+            reader = capture.reader if capture is not None else LiberoSceneMap(session.env)
+            if config["task_rule"]["calibration"] != reader.config["version"]:
+                raise ValueError("任务状态规则与实际Scene map版本不同")
+            recorder = (
+                capture.recorder
+                if capture is not None
+                else SceneRecorder(rollout_id, max_gap_s=reader.config["max_sample_gap_s"])
+            )
+            if capture is None:
+                recorder.observe(reader.read(0))
+            if task is None and question["parameters"]["query"]["entity"] not in reader.nodes:
+                raise ValueError("题目实体未绑定到真实场景")
+            condition = hashlib.sha256(session.env.sim.get_state().flatten().tobytes()).hexdigest()
+            if initial_digest is None:
+                initial_digest = condition
+                save_json(
+                    output / "initial-rule.json",
+                    dict(scene_config=reader.config, initial_state_sha256=condition, rule=config["task_rule"]),
+                )
+            elif condition != initial_digest:
+                raise ValueError("动作组初态不一致")
+            chat = LiveChat(policy, processor)
+            chat.rl_processor = processor
+            chat.rl_sampling_mode = config["sampling_mode"]
+            chat.rl_compute_dtype = config["compute_dtype"]
+            chat.start(session.task, build_libero_raw_obs(session.observation, session.task)[0])
+            directory = output / rollout_id
+            phase = collect_phase(
+                session,
+                chat,
+                phase="execution",
+                env_steps=config["execution_steps"],
+                token_budget=config["execution_token_budget"],
+                seed=config["seed"] + i,
+                directory=directory,
+                reader=reader,
+                recorder=recorder,
+                scene_capture=capture,
+            )
+            # 训练任务的QA原封不动复用；动作奖励读独立目标，不能把QA答案当任务完成。
+            task_result = state_task_reward(task, config["task_rule"], reader, recorder) if task else None
+            binding = bind_delivery(question, recorder, config["entity_names"], rollout_id)
+            private_history = recorder.export()
+            save_json(directory / "delivery.json", private_history["questions"][question["question_id"]])
+            save_json(directory / "scene-map.json", private_history)
+            if binding["gt"]["status"] != "ok":
+                raise ValueError("任务/QA语义状态未知，不能填零奖励")
+            if task_result is None:
+                state = binding["gt"]["value"]
+                if state not in ["open", "closed", "partially_open"]:
+                    raise ValueError("设备状态不符合已冻结规则")
+                task_result = dict(task_reward=float(state == config["task_rule"]["target_state"]))
+            reward = task_result["task_reward"]
+            record = Segment(
+                rollout_id,
+                "execution",
+                "execution-group",
+                initial_digest,
+                config["case_id"],
+                policy_version,
+                config["execution_group_size"],
+                phase["prefix_length"] - 1,
+                phase["end_length"] - 1,
+                reward,
+                "scored",
+            )
+            records.append(record)
+            phase["inputs_path"] = str(directory / "inputs.pt")
+            artifacts.append(phase)
+            parents.append((session, chat, phase, binding))
+            save_json(
+                directory / "reward.json",
+                dict(**task_result, binding=binding, native_success=session.audit()["native_success"]),
+            )
+            save_json(
+                output / "progress.json",
+                dict(phase="execution", finished=i + 1, planned=config["execution_group_size"]),
+            )
+        selected = select_parent(records, seed=config["seed"], mode="uniform")
+        parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
+        session, chat, phase, binding = parents[parent_index]
+        base_chat = fork_chat(chat)
+        base_chat.question(question["question"], pending_assistant=phase["pending_assistant"])
+        prefix_hash = chat_fingerprint(base_chat)
+        qa_condition = hashlib.sha256((prefix_hash + binding["binding_sha256"]).encode()).hexdigest()
+        save_json(
+            output / "selection.json",
+            dict(
+                parent_rollout_id=selected,
+                parent_reward=records[parent_index].reward,
+                selection="uniform",
+                seed=config["seed"],
+                prefix_sha256=prefix_hash,
+                condition_id=qa_condition,
+            ),
+        )
+        client = JudgeClient(
+            Path(os.environ["PHYSICAL_AI_JUDGE_ACCESS_FILE"]), model=config["judge_model"], timeout_s=90
+        )
+        for i in range(config["qa_group_size"]):
+            child_id = f"qa-{i}"
+            with session.fork() as child:
+                child_chat = fork_chat(base_chat)
+                if chat_fingerprint(child_chat) != prefix_hash:
+                    raise ValueError("QA分支会话前缀不同")
+                directory = output / child_id
+                answer = collect_phase(
+                    child,
+                    child_chat,
+                    phase="qa",
+                    env_steps=config["qa_steps"],
+                    token_budget=config["qa_token_budget"],
+                    seed=config["seed"] + 100 + i,
+                    directory=directory,
+                    generated=phase["generated"],
+                    old_logprobs=phase["old_logprobs"],
+                )
+                judgment = score_answer(binding, answer["answer"], client, rollout_id=selected)
+                save_json(directory / "judge.json", judgment)
+                if judgment["status"] != "scored":
+                    raise ValueError("judge未给有效分数，整个组保留待恢复，禁止更新")
+                records.append(
+                    Segment(
+                        child_id,
+                        "qa",
+                        "qa-group",
+                        qa_condition,
+                        config["case_id"],
+                        policy_version,
+                        config["qa_group_size"],
+                        answer["prefix_length"] - 1,
+                        answer["end_length"] - 1,
+                        float(judgment["score"]),
+                        "scored",
+                        parent_rollout_id=selected,
+                    )
+                )
+                answer["inputs_path"] = str(directory / "inputs.pt")
+                artifacts.append(answer)
+                save_json(output / "progress.json", dict(phase="qa", finished=i + 1, planned=config["qa_group_size"]))
+                if chat_fingerprint(base_chat) != prefix_hash:
+                    raise ValueError("子分支改动了父会话")
+        save_json(output / "groups.json", [asdict(r) for r in records])
+    return records, artifacts
+
+
 def main():
     """仅运行明确给定配置的一组采样/一次诊断更新；输出新目录，原权重绝不覆盖。"""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -37,36 +236,52 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--reuse-rollouts", type=Path, help="仅恢复已有完整组的更新，不重新采样或judge")
+    parser.add_argument("--task-release", type=Path, help="从SFT导出的RL任务目录；需同时指定task-id")
+    parser.add_argument("--task-id", help="固定训练任务ID，不按源轨迹成败选择")
+    parser.add_argument("--save-checkpoint", action="store_true", help="实际更新后另存原生权重；不覆盖起点")
     args = parser.parse_args()
+    if bool(args.task_release) != bool(args.task_id):
+        parser.error("task-release与task-id必须同时指定")
+    if args.save_checkpoint and not args.update:
+        parser.error("save-checkpoint要求update")
+    if args.task_release:
+        args.task_release = args.task_release.resolve()
+        if args.reuse_rollouts:
+            parser.error("训练任务采集暂不支持reuse-rollouts；不能借用旧debug组")
     for key in ("bundle", "checkpoint", "case", "output"):
         setattr(args, key, getattr(args, key).resolve())
     args.output.mkdir(parents=True, exist_ok=False)
-    from verl.experimental.physical_ai.online_reward import bind_delivery, save_json, score_answer
+    from verl.experimental.physical_ai.online_reward import save_json
 
     try:
         import torch
         from benchmark.adapters import libero_env  # noqa: F401
-        from benchmark.adapters.libero_scene_map import LiberoSceneMap
-        from benchmark.core.scene_graph import SceneRecorder
         from benchmark.libero.questions.contracts import definition_hash
         from benchmark.libero.questions.registry import default_registry
-        from benchmark.scoring.llm_judge import JudgeClient
-        from experiments.libero.libero_eval_utils import build_libero_raw_obs
-        from libero.libero import benchmark
-        from rollout.g05.chat_libero import LiveChat
         from runtime import load_policy
 
-        from verl.experimental.physical_ai.g05_rollout import chat_fingerprint, collect_phase
-        from verl.experimental.physical_ai.libero_session import LiberoSession
-        from verl.experimental.physical_ai.sampling import fork_chat
-        from verl.experimental.physical_ai.seggrpo import Segment, select_parent
+        from verl.experimental.physical_ai.seggrpo import Segment
+        from verl.experimental.physical_ai.task_data import (
+            load_task_release,
+        )
 
         config = json.loads(args.case.read_text())
         case_hash = hashlib.sha256(args.case.read_bytes()).hexdigest()
-        if config["split"] != "debug":
+        task, resources = load_task_release(args.task_release, args.task_id) if args.task_release else (None, None)
+        if task is None and config["split"] != "debug":
             raise ValueError("此单组诊断只接受debug case，不是正式训练任务表")
-        suite = benchmark.get_benchmark_dict()[config["suite"]]()
-        task_index = next(i for i in range(suite.n_tasks) if suite.get_task(i).name == config["task_name"])
+        if task is not None:
+            if config["task_rule"]["task_name"] != task["environment"]["task_name"]:
+                raise ValueError("配置的任务规则不能套到其他训练任务")
+            config.update(
+                split="train",
+                case_id=task["id"],
+                suite=task["environment"]["suite"],
+                task_name=task["environment"]["task_name"],
+                question=task["followup"]["question_spec"],
+                entity_names=task["followup"]["entity_names"],
+            )
+            save_json(args.output / "task.json", task)
         question = config["question"]
         question["definition_hash"] = definition_hash(question)
         default_registry().validate(question)
@@ -92,6 +307,7 @@ def main():
                 full_verl_trainer=False,
                 update=args.update,
                 behavior_contract="fp32-output-head-v1:" + config["sampling_mode"],
+                task_release=str(args.task_release) if args.task_release else None,
             ),
         )
         save_json(args.output / "progress.json", dict(phase="loading_model"))
@@ -142,157 +358,15 @@ def main():
             save_json(args.output / "summary.json", dict(reused_rollouts=str(source), update=result))
             save_json(args.output / "progress.json", dict(phase="complete", optimizer_step=result["optimizer_step"]))
             return
-        records, artifacts, parents = [], [], []
-        # 所有父环境保留到选中一个，再为每条QA建立独立副本；退出后统一释放再训练。
-        with ExitStack() as stack:
-            initial_digest = None
-            for i in range(config["execution_group_size"]):
-                rollout_id = f"execution-{i}"
-                session = stack.enter_context(
-                    LiberoSession(
-                        config["suite"],
-                        task_index,
-                        initial_state_index=config["initial_state_index"],
-                        seed=config["environment_seed"],
-                        max_steps=config["execution_steps"] + config["qa_steps"],
-                    )
-                )
-                reader = LiberoSceneMap(session.env)
-                if config["task_rule"]["calibration"] != reader.config["version"]:
-                    raise ValueError("任务状态规则与实际Scene map版本不同")
-                recorder = SceneRecorder(rollout_id, max_gap_s=reader.config["max_sample_gap_s"])
-                recorder.observe(reader.read(0))
-                if question["parameters"]["query"]["entity"] not in reader.nodes:
-                    raise ValueError("题目实体未绑定到真实场景")
-                condition = hashlib.sha256(session.env.sim.get_state().flatten().tobytes()).hexdigest()
-                if initial_digest is None:
-                    initial_digest = condition
-                    save_json(
-                        args.output / "initial-rule.json",
-                        dict(scene_config=reader.config, initial_state_sha256=condition, rule=config["task_rule"]),
-                    )
-                elif condition != initial_digest:
-                    raise ValueError("动作组初态不一致")
-                chat = LiveChat(policy, processor)
-                chat.rl_processor = processor
-                chat.rl_sampling_mode = config["sampling_mode"]
-                chat.rl_compute_dtype = config["compute_dtype"]
-                chat.start(session.task, build_libero_raw_obs(session.observation, session.task)[0])
-                directory = args.output / rollout_id
-                phase = collect_phase(
-                    session,
-                    chat,
-                    phase="execution",
-                    env_steps=config["execution_steps"],
-                    token_budget=config["execution_token_budget"],
-                    seed=config["seed"] + i,
-                    directory=directory,
-                    reader=reader,
-                    recorder=recorder,
-                )
-                # 此小试任务规则是版本化Scene map状态“middle drawer=open”，不读原生success。
-                binding = bind_delivery(question, recorder, config["entity_names"], rollout_id)
-                private_history = recorder.export()
-                save_json(directory / "delivery.json", private_history["questions"][question["question_id"]])
-                save_json(directory / "scene-map.json", private_history)
-                if binding["gt"]["status"] != "ok":
-                    raise ValueError("任务/QA语义状态未知，不能填零奖励")
-                state = binding["gt"]["value"]
-                if state not in ["open", "closed", "partially_open"]:
-                    raise ValueError("设备状态不符合已冻结规则")
-                reward = float(state == config["task_rule"]["target_state"])
-                record = Segment(
-                    rollout_id,
-                    "execution",
-                    "execution-group",
-                    initial_digest,
-                    config["case_id"],
-                    policy_version,
-                    config["execution_group_size"],
-                    phase["prefix_length"] - 1,
-                    phase["end_length"] - 1,
-                    reward,
-                    "scored",
-                )
-                records.append(record)
-                phase["inputs_path"] = str(directory / "inputs.pt")
-                artifacts.append(phase)
-                parents.append((session, chat, phase, binding))
-                save_json(
-                    directory / "reward.json",
-                    dict(task_reward=reward, binding=binding, native_success=session.audit()["native_success"]),
-                )
-                save_json(
-                    args.output / "progress.json",
-                    dict(phase="execution", finished=i + 1, planned=config["execution_group_size"]),
-                )
-            selected = select_parent(records, seed=config["seed"], mode="uniform")
-            parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
-            session, chat, phase, binding = parents[parent_index]
-            base_chat = fork_chat(chat)
-            base_chat.question(question["question"], pending_assistant=phase["pending_assistant"])
-            prefix_hash = chat_fingerprint(base_chat)
-            qa_condition = hashlib.sha256((prefix_hash + binding["binding_sha256"]).encode()).hexdigest()
-            save_json(
-                args.output / "selection.json",
-                dict(
-                    parent_rollout_id=selected,
-                    parent_reward=records[parent_index].reward,
-                    selection="uniform",
-                    seed=config["seed"],
-                    prefix_sha256=prefix_hash,
-                    condition_id=qa_condition,
-                ),
-            )
-            client = JudgeClient(
-                Path(os.environ["PHYSICAL_AI_JUDGE_ACCESS_FILE"]), model=config["judge_model"], timeout_s=90
-            )
-            for i in range(config["qa_group_size"]):
-                child_id = f"qa-{i}"
-                with session.fork() as child:
-                    child_chat = fork_chat(base_chat)
-                    if chat_fingerprint(child_chat) != prefix_hash:
-                        raise ValueError("QA分支会话前缀不同")
-                    directory = args.output / child_id
-                    answer = collect_phase(
-                        child,
-                        child_chat,
-                        phase="qa",
-                        env_steps=config["qa_steps"],
-                        token_budget=config["qa_token_budget"],
-                        seed=config["seed"] + 100 + i,
-                        directory=directory,
-                        generated=phase["generated"],
-                        old_logprobs=phase["old_logprobs"],
-                    )
-                    judgment = score_answer(binding, answer["answer"], client, rollout_id=selected)
-                    save_json(directory / "judge.json", judgment)
-                    if judgment["status"] != "scored":
-                        raise ValueError("judge未给有效分数，整个组保留待恢复，禁止更新")
-                    records.append(
-                        Segment(
-                            child_id,
-                            "qa",
-                            "qa-group",
-                            qa_condition,
-                            config["case_id"],
-                            policy_version,
-                            config["qa_group_size"],
-                            answer["prefix_length"] - 1,
-                            answer["end_length"] - 1,
-                            float(judgment["score"]),
-                            "scored",
-                            parent_rollout_id=selected,
-                        )
-                    )
-                    answer["inputs_path"] = str(directory / "inputs.pt")
-                    artifacts.append(answer)
-                    save_json(
-                        args.output / "progress.json", dict(phase="qa", finished=i + 1, planned=config["qa_group_size"])
-                    )
-                    if chat_fingerprint(base_chat) != prefix_hash:
-                        raise ValueError("子分支改动了父会话")
-            save_json(args.output / "groups.json", [asdict(r) for r in records])
+        records, artifacts = collect_group(
+            policy,
+            processor,
+            config,
+            args.output,
+            policy_version=policy_version,
+            task=task,
+            resources=resources,
+        )
         import gc
 
         gc.collect()
@@ -303,12 +377,31 @@ def main():
 
             save_json(args.output / "progress.json", dict(phase="update"))
             result = update_once(policy.model, records, artifacts, args.output, compute_dtype=config["compute_dtype"])
+        if args.save_checkpoint and result["optimizer_step"]:
+            # 原生loader要求外层policy的state_dict；不能只保存内部model丢失codec或前缀。
+            # checkpoint仅供后续加载核验，SGD无动量小试不宣称具备生产Trainer恢复状态。
+            target = args.output / "checkpoints/step_1.pt"
+            target.parent.mkdir()
+            temporary = target.with_suffix(".building")
+            save_json(args.output / "progress.json", dict(phase="saving_checkpoint"))
+            torch.save(
+                dict(
+                    model_state_dict={k: v.detach().cpu() for k, v in policy.state_dict().items()},
+                    global_step=1,
+                    source_checkpoint=str(args.checkpoint),
+                    kind="seggrpo_single_update_diagnostic",
+                    production_resume=False,
+                ),
+                temporary,
+            )
+            temporary.rename(target)
+            result["checkpoint"] = str(target)
         save_json(
             args.output / "summary.json",
             dict(
                 execution_rewards=[r.reward for r in records if r.phase == "execution"],
                 qa_rewards=[r.reward for r in records if r.phase == "qa"],
-                selected_parent=selected,
+                selected_parent=next(r.parent_rollout_id for r in records if r.phase == "qa"),
                 update=result,
             ),
         )
