@@ -1,0 +1,57 @@
+{
+  "schema": "physical-ai.rl-reward-contract.draft-v1",
+  "status": "draft_not_runnable",
+  "task": {
+    "source": "versioned_task_monitor",
+    "rule_ref": null,
+    "native_success_is_diagnostic_only": true
+  },
+  "qa": {
+    "source": "same_rollout_scene_map_pop",
+    "question_selection": "fixed_before_rollout",
+    "gt_anchor": "question_delivery",
+    "response": "qa_turn_public_assistant_text",
+    "judge": {
+      "implementation": "benchmark.scoring.llm_judge.judge_answer",
+      "model": "gpt-5.6-sol",
+      "rubric_version": "execution-qa-text-judge-v2.1",
+      "access_file_env": "PHYSICAL_AI_JUDGE_ACCESS_FILE",
+      "timeout_seconds": 60,
+      "max_attempts": 3,
+      "max_concurrency": 8,
+      "cache_key_fields": [
+        "question_definition_hash",
+        "question_text",
+        "ground_truth_content_hash",
+        "answer_content_hash",
+        "judge_model_revision",
+        "rubric_sha256"
+      ]
+    }
+  },
+  "combination": {
+    "kind": "separate_segment_grpo_losses",
+    "execution_loss_weight": 1.0,
+    "qa_loss_weight": 1.0,
+    "weights_status": "initial_equal_weight_proposal",
+    "normalize_each_phase_separately": true,
+    "qa_prefix_policy_loss": false
+  },
+  "errors": {
+    "judge_failure": "retry_same_answer_then_block_group",
+    "undetermined_ground_truth": "block_group_for_diagnosis",
+    "simulator_failure": "invalid_rollout_not_zero_reward"
+  },
+  "algorithm": {
+    "name": "seggrpo",
+    "base_estimator": "grpo",
+    "execution_group_size": null,
+    "qa_group_size": null,
+    "parent_selection": "uniform_without_success_filter",
+    "qa_parents_per_execution_group": 1,
+    "shared_behavior_policy_version": true,
+    "update_after_both_groups_collected": true,
+    "normalize_advantages": "within_phase_and_condition",
+    "zero_reward_variance": "zero_advantage"
+  }
+}

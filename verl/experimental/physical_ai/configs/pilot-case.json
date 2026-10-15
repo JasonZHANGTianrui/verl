@@ -1,0 +1,48 @@
+{
+  "schema": "physical-ai.rl-case.debug-v1",
+  "split": "debug",
+  "case_id": "seggrpo-debug/middle-drawer/init47",
+  "suite": "libero_goal",
+  "task_name": "open_the_middle_drawer_of_the_cabinet",
+  "initial_state_index": 47,
+  "environment_seed": 42,
+  "seed": 42,
+  "execution_group_size": 4,
+  "qa_group_size": 4,
+  "execution_steps": 128,
+  "qa_steps": 32,
+  "execution_token_budget": 6144,
+  "qa_token_budget": 6144,
+  "judge_model": "gpt-5.6-sol",
+  "task_rule": {
+    "version": "rl-device-state-goal-v1",
+    "state_query": "question.parameters.query",
+    "target_state": "open",
+    "calibration": "libero-scene-map-draft-2",
+    "native_success_is_diagnostic_only": true
+  },
+  "question": {
+    "schema": "physical-ai.question-spec.v1",
+    "case_id": "seggrpo-debug/middle-drawer/init47",
+    "question_id": "seggrpo-debug/middle-drawer/init47/qa",
+    "slot": 1,
+    "strategy_id": "Q06",
+    "strategy_version": "v0.1",
+    "parameters": {
+      "query": {
+        "op": "attribute",
+        "entity": "wooden_cabinet_1/wooden_cabinet_1_cabinet_middle",
+        "path": "states.wooden_cabinet_1_middle_level.value"
+      }
+    },
+    "semantic_answer_type": "attribute",
+    "answer_format": "freeform",
+    "interaction_mode": "P0",
+    "question": "What is the current state of the middle drawer?"
+  },
+  "entity_names": {
+    "wooden_cabinet_1/wooden_cabinet_1_cabinet_middle": "the middle drawer"
+  },
+  "sampling_mode": "recompute",
+  "compute_dtype": "float32"
+}

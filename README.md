@@ -312,3 +312,9 @@ Founded in 2023, ByteDance Seed Team is dedicated to crafting the industry's mos
 </div>
 
 We are HIRING! Send us an [email](mailto:the.verl.project@gmail.com) if you are interested in internship/FTE opportunities in RL for agents.
+
+## Physical AI fork
+
+本仓库在Physical AI工作区中作为`training-pipeline/ours/rl`子模块使用。
+具身训练适配、SegGRPO及验证入口见[Physical AI适配](verl/experimental/physical_ai/README.md)。
+SFT→RL转换与造数据由主项目的`data-pipeline/ours/rl`维护。

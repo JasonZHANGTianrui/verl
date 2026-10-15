@@ -1,0 +1,4 @@
+# 自定义loop入口；只有完成robot.execute与模型后端适配后才可用于训练。
+# 同时设置actor_rollout_ref.rollout.multi_turn.max_parallel_calls=1。
+- name: robot_agent
+  _target_: verl.experimental.physical_ai.episode_agent_loop.EpisodeToolAgentLoop

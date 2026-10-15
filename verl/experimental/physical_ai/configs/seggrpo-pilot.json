@@ -1,0 +1,23 @@
+{
+  "schema": "physical-ai.seggrpo-component.v0.1",
+  "status": "component_only_not_training_launcher",
+  "execution_group_size": 4,
+  "qa_group_size": 4,
+  "parent_selection": "uniform",
+  "seed": 42,
+  "advantage": {
+    "implementation": "verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage",
+    "epsilon": 0.000001,
+    "norm_adv_by_std_in_grpo": true
+  },
+  "policy_loss": {
+    "implementation": "verl.trainer.ppo.core_algos.compute_policy_loss_vanilla",
+    "clip_ratio": 0.2,
+    "clip_ratio_c": 3.0,
+    "within_group_reduction": "seq-mean-token-mean",
+    "between_group_reduction": "mean_per_phase",
+    "execution_weight": 1.0,
+    "qa_weight": 1.0,
+    "reference_kl": "not_connected"
+  }
+}
