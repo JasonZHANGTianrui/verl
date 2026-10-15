@@ -183,6 +183,7 @@ def _distributed_gradient_worker(rank, rendezvous):
     from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
 
     dist.init_process_group("gloo", init_method="file://" + rendezvous, rank=rank, world_size=2)
+    control_group = dist.new_group(backend="gloo")
     try:
         for qa_rewards in ([0, 1], [1, 1]):
             torch.manual_seed(7)
@@ -216,7 +217,7 @@ def _distributed_gradient_worker(rank, rendezvous):
                     config=config,
                 )
                 (value / (3 if rows[i].phase == "execution" else 2)).backward()
-            sum_gradients(model)
+            sum_gradients(model, control_group=control_group)
             for expected, actual in zip(reference.parameters(), model.parameters(), strict=False):
                 torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-5, atol=1e-6)
             optimizer = torch.optim.SGD(model.parameters(), lr=0.01)

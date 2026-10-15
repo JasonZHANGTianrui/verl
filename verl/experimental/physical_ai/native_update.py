@@ -42,6 +42,7 @@ def update_once(
     enforce_on_policy=True,
     clip_ratio=0.2,
     clip_ratio_c=3.0,
+    control_group=None,
 ):
     """收齐组后逐条重算、累积两阶段GRPO梯度，执行一次优化器更新并记录真实变化。
 
@@ -54,6 +55,7 @@ def update_once(
     prepared由prepare_batch在采样后、更新前计算；indices选取一个完整mini-batch。
     多mini-batch路径须先validate_behavior核验同版概率，再用enforce_on_policy=False；
     此后新旧策略差异属于正常策略更新，不能触发原同版一致性门槛。
+    control_group是同成员Gloo组，仅承载CPU元数据/就绪同步；实际梯度仍走默认GPU组。
     """
     from generate import no_cache_hidden
     from memory import checkpoint_linear_layers
@@ -153,9 +155,9 @@ def update_once(
     if distributed:
         from .distributed import sum_gradients
 
-        sum_gradients(model)
+        sum_gradients(model, control_group=control_group)
         all_rows = [None] * world_size
-        dist.all_gather_object(all_rows, rows)
+        dist.all_gather_object(all_rows, rows, group=control_group)
         rows = sorted((row for shard in all_rows for row in shard), key=lambda row: row["rollout_id"])
     norms = []
     representative = None
@@ -204,7 +206,9 @@ def update_once(
 
 
 @torch.no_grad()
-def validate_behavior(model, records, artifacts, prepared, output, *, distributed=False, max_error=0.05):
+def validate_behavior(
+    model, records, artifacts, prepared, output, *, distributed=False, max_error=0.05, control_group=None
+):
     """参数未更新时核验整批真实生成概率，包括零优势组；后续mini-batch不再做此门禁。
 
     每rank检查自己的行，任何一行不匹配则所有rank拒绝更新。采用与采样一致的
@@ -245,7 +249,7 @@ def validate_behavior(model, records, artifacts, prepared, output, *, distribute
     reports = [dict(rows=rows, failure=failure)]
     if distributed:
         reports = [None] * world
-        dist.all_gather_object(reports, dict(rows=rows, failure=failure))
+        dist.all_gather_object(reports, dict(rows=rows, failure=failure), group=control_group)
     if any(report["failure"] for report in reports):
         raise ValueError("整批拒绝更新：" + str([r["failure"] for r in reports if r["failure"]]))
     rows = [row for report in reports for row in report["rows"]]

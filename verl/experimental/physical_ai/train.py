@@ -104,21 +104,29 @@ def main():
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
     runtime_config = json.loads(args.config.read_text())
+    # EGL设备序号与CUDA local_rank是两个命名空间；容器可能有两张计算卡但仅一个EGL设备。
+    # 默认沿渲染器的设备0，允许部署显式覆盖，不修改模型所在CUDA卡。
+    egl_device = runtime_config.get("egl_device_id", 0)
+    if type(egl_device) is not int or egl_device < 0:
+        raise ValueError("egl_device_id须是EGL枚举中的非负整数，不能使用CUDA rank推断")
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(egl_device)
+    control_group = None
     if world > 1:
-        dist.init_process_group(
-            "nccl", timeout=timedelta(minutes=runtime_config.get("collective_timeout_minutes", 180))
-        )
+        timeout = timedelta(minutes=runtime_config.get("collective_timeout_minutes", 180))
+        dist.init_process_group("nccl", timeout=timeout)
+        # 环境与语言采样耗时可差很多；CPU状态同步不应预先启动等待另一rank的CUDA操作。
+        control_group = dist.new_group(backend="gloo", timeout=timeout)
 
     def broadcast(value):
         """rank0的采集/保存状态显式广播；异常不能让其他rank误进入下一次更新。"""
         payload = [value]
         if world > 1:
-            dist.broadcast_object_list(payload, src=0)
+            dist.broadcast_object_list(payload, src=0, group=control_group)
         return payload[0]
 
     tracker = None
+    failed = False
     try:
         config = runtime_config
         if config["sampling_mode"] != "recompute" or config["compute_dtype"] != "float32":
@@ -217,6 +225,9 @@ def main():
                     source_checkpoint_sha256=contract["source_checkpoint_sha256"],
                     tasks_sha256=contract["tasks_sha256"],
                     save_freq_unit="sampling_batch",
+                    egl_device_id=egl_device,
+                    control_backend="gloo",
+                    gradient_backend="nccl",
                     reference_model=False,
                     critic=False,
                     entropy_computed=False,
@@ -271,57 +282,51 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
             policy.model.eval()
-            local_tasks, failure = [], None
-            try:
-                for offset in range(tasks_per_batch):
-                    owner = offset % world if config.get("parallel_rollouts", False) else 0
-                    if owner != rank:
-                        continue
-                    task_index = group_index + offset
-                    task = eligible[task_index % len(eligible)]
-                    run_config = deepcopy(config)
-                    run_config.update(
-                        case_id=task["id"],
-                        suite=task["environment"]["suite"],
-                        task_name=task["environment"]["task_name"],
-                        question=task["followup"]["question_spec"],
-                        entity_names=task["followup"]["entity_names"],
-                        seed=config["seed"] + task_index * 1000,
+            local_tasks = []
+            # 任一rank采样失败直接抛给外层落盘和torchrun；不得把异常藏进一个长时间等待的collective。
+            for offset in range(tasks_per_batch):
+                owner = offset % world if config.get("parallel_rollouts", False) else 0
+                if owner != rank:
+                    continue
+                task_index = group_index + offset
+                task = eligible[task_index % len(eligible)]
+                run_config = deepcopy(config)
+                run_config.update(
+                    case_id=task["id"],
+                    suite=task["environment"]["suite"],
+                    task_name=task["environment"]["task_name"],
+                    question=task["followup"]["question_spec"],
+                    entity_names=task["followup"]["entity_names"],
+                    seed=config["seed"] + task_index * 1000,
+                )
+                task_dir = directory / f"task-{task_index:06d}"
+                task_dir.mkdir()
+                save_json(task_dir / "task.json", task)
+                save_json(
+                    args.output / f"progress-rank-{rank}.json",
+                    dict(phase="sampling", batch=batch_index, task_index=task_index, finished_tasks=len(local_tasks)),
+                )
+                task_records, task_artifacts = collect_group(
+                    policy,
+                    processor,
+                    run_config,
+                    task_dir,
+                    policy_version=f"{contract['source_checkpoint_sha256']}/update-{updates}",
+                    task=task,
+                    resources=resources,
+                )
+                local_tasks.append(
+                    dict(
+                        index=task_index,
+                        records=namespace_group(task_records, f"task-{task_index:06d}"),
+                        artifacts=task_artifacts,
                     )
-                    task_dir = directory / f"task-{task_index:06d}"
-                    task_dir.mkdir()
-                    save_json(task_dir / "task.json", task)
-                    save_json(
-                        args.output / f"progress-rank-{rank}.json",
-                        dict(
-                            phase="sampling", batch=batch_index, task_index=task_index, finished_tasks=len(local_tasks)
-                        ),
-                    )
-                    task_records, task_artifacts = collect_group(
-                        policy,
-                        processor,
-                        run_config,
-                        task_dir,
-                        policy_version=f"{contract['source_checkpoint_sha256']}/update-{updates}",
-                        task=task,
-                        resources=resources,
-                    )
-                    local_tasks.append(
-                        dict(
-                            index=task_index,
-                            records=namespace_group(task_records, f"task-{task_index:06d}"),
-                            artifacts=task_artifacts,
-                        )
-                    )
-            except Exception:
-                failure = traceback.format_exc()
-            reports = [dict(tasks=local_tasks, failure=failure)]
+                )
+            reports = [local_tasks]
             if world > 1:
                 reports = [None] * world
-                dist.all_gather_object(reports, dict(tasks=local_tasks, failure=failure))
-            if any(r["failure"] for r in reports):
-                raise RuntimeError("采样batch不完整，禁止更新：" + str([r["failure"] for r in reports if r["failure"]]))
-            collected = sorted([t for r in reports for t in r["tasks"]], key=lambda t: t["index"])
+                dist.all_gather_object(reports, local_tasks, group=control_group)
+            collected = sorted([t for rank_tasks in reports for t in rank_tasks], key=lambda t: t["index"])
             if len(collected) != tasks_per_batch:
                 raise ValueError("采样任务数不完整")
             records = [r for t in collected for r in t["records"]]
@@ -354,6 +359,7 @@ def main():
                 directory,
                 distributed=world > 1,
                 max_error=config.get("behavior_logprob_tolerance", 0.05),
+                control_group=control_group,
             )
             validation_seconds = time.monotonic() - validation_started
             for mini_index, indices in enumerate(minis):
@@ -386,6 +392,7 @@ def main():
                     enforce_on_policy=False,
                     clip_ratio=config.get("clip_ratio", 0.2),
                     clip_ratio_c=config.get("clip_ratio_c", 3.0),
+                    control_group=control_group,
                 )
                 updates += int(result["optimizer_step"])
                 if rank == 0:
@@ -410,7 +417,7 @@ def main():
                 if world > 1:
                     local_memory = memory[0]
                     memory = [None] * world
-                    dist.all_gather_object(memory, local_memory)
+                    dist.all_gather_object(memory, local_memory, group=control_group)
                 if rank == 0:
                     metrics["memory/max_allocated_gib"] = max(m["allocated"] for m in memory) / 2**30
                     metrics["memory/max_reserved_gib"] = max(m["reserved"] for m in memory) / 2**30
@@ -426,7 +433,7 @@ def main():
             states = [rng_state()] if should_save else []
             if should_save and world > 1:
                 states = [None] * world
-                dist.all_gather_object(states, rng_state())
+                dist.all_gather_object(states, rng_state(), group=control_group)
             saved = None
             if rank == 0:
                 try:
@@ -481,14 +488,20 @@ def main():
                 ),
             )
     except BaseException:
-        if rank == 0 and args.output.is_dir():
-            save_json(args.output / "fatal.json", dict(traceback=traceback.format_exc()))
-            save_json(args.output / "progress.json", dict(phase="failed"))
+        failed = True
+        detail = dict(rank=rank, traceback=traceback.format_exc())
+        traceback.print_exc()
+        if args.output.is_dir():
+            save_json(args.output / f"fatal-rank-{rank}.json", detail)
+            save_json(args.output / f"progress-rank-{rank}.json", dict(phase="failed", failure=detail))
+            save_json(args.output / "fatal.json", detail)
+            save_json(args.output / "progress.json", dict(phase="failed", failure_rank=rank))
         raise
     finally:
         if tracker is not None:
             tracker.finish()
-        if world > 1:
+        # 错误路径由torchrun终止其他rank，不等待仍在仿真的进程一起销毁通信组。
+        if world > 1 and not failed:
             dist.destroy_process_group()
 
 

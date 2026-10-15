@@ -133,8 +133,9 @@ PPO epoch，最多4次更新。total_training_steps=100按采样batch计，共80
 不冒称FSDP/ZeRO-3。更新前沿原全局梯度归约；保存前清梯度并由全部rank合并优化器
 状态到rank0，随后保存原生完整权重/优化器/游标/RNG。单卡分片配置明确拒绝。
 
-两个rank分别采完整任务，同一任务的环境/动作/QA仍在同一进程串行，EGL按本rank
-GPU绑定。任何任务失败于资源、GT或接口时拒绝整个采样batch，不缩组。保存/停止
+两个rank分别采完整任务，同一任务的环境/动作/QA仍在同一进程串行。本rank的
+CUDA卡负责模型；EGL渲染设备独立使用egl_device_id（默认0），不能用CUDA local_rank
+代替EGL序号。任何任务失败于资源、GT或接口时拒绝整个采样batch，不缩组。保存/停止
 必须在完整采样batch边界。save_freq=10每10批保存，max_ckpt_to_keep=1只保留
 本输出目录最新完整checkpoint；新权重、完整优化器和manifest落盘并更新latest后
 才清理旧版本。源checkpoint、其他实验和GPU验收文件不清理。恢复需要新output目录，
@@ -169,3 +170,15 @@ mini不更新参数，但仍记录奖励与采样进度。rollout指标覆盖包
 actor的active_clip/ratio/old_policy_k3只统计真正反向的响应。old_policy_k3是相对
 采样旧策略的诊断，不能当reference KL。old_sampled_nll也不是完整词表精确entropy。
 当前不宣称有定期独立验证集测评；训练奖励不能替代benchmark成绩。
+
+### 设备编号与采样失败
+
+CUDA local_rank与MUJOCO_EGL_DEVICE_ID不是同一枚举。容器可暴露两张计算卡、但
+EGL只提供一个渲染后端；配置中的egl_device_id独立选择渲染设备，两rank可共享
+EGL设备0，不改变各自模型的CUDA卡。运行环境须核对实际GL_RENDERER；不能把
+使用EGL自动等同于NVIDIA GPU渲染。
+
+采样/元数据/状态同步走独立Gloo组；模型梯度及ZeRO参数同步仍走NCCL。采样错误
+立即写fatal-rank-N.json并抛出，由torchrun终止其他worker，不先等待整批采完。
+progress同时标failed，避免只有rank0写异常而丢失rank1的最初报错。错误路径不
+等待正常集体销毁通信组；正常结束仍由所有rank按相同顺序清理。
