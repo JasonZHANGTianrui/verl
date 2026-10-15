@@ -10,7 +10,7 @@
 | --- | --- |
 | `seggrpo.py`、`distributed.py` | 两阶段优势、loss、全局分组及分片梯度归约 |
 | `episode_agent_loop.py` | 沿官方工具循环维护整回合的有状态工具 |
-| `sampling.py`、`g05_rollout.py` | 原生token采样、完整前缀和实际动作执行 |
+| `sampling.py`、`batched_sampling.py`、`g05_rollout.py` | 单条参照、共享模型批量生成及实际动作执行 |
 | `g05_logprobs.py`、`precision.py` | 动作／文字概率与FP32参考路径 |
 | `native_update.py` | 原生模型的mini-batch更新；旧无优化器入口保留SGD诊断 |
 | `pilot.py`、`distributed_update.py` | 真实4＋4小组、跨区采样附件核验及更新入口 |
@@ -54,7 +54,7 @@ torchrun --standalone --nproc_per_node=2 --module verl.experimental.physical_ai.
 
 ## 验收边界
 
-当前使用完整历史重算与FP32作为正确性参考。短片段概率对照不能替代完整真实
+当前使用FP32完整历史重算作为训练概率参照；生产采样可用已通过逐token核验的原生缓存批量路径。短片段概率对照不能替代完整真实
 轨迹核对；混合精度/KV缓存后端要另验收，不放宽阈值或重写旧采样概率。
 动作和QA组分别归一化，均匀选父轨迹，不按成功筛选；QA父前缀不重复计直接loss。
 全同分组优势为零；缺分、API错误或未知GT不能填成0并缩组训练。
@@ -182,3 +182,32 @@ EGL设备0，不改变各自模型的CUDA卡。运行环境须核对实际GL_REN
 立即写fatal-rank-N.json并抛出，由torchrun终止其他worker，不先等待整批采完。
 progress同时标failed，避免只有rank0写异常而丢失rank1的最初报错。错误路径不
 等待正常集体销毁通信组；正常结束仍由所有rank按相同顺序清理。
+
+### 组内批量生成与缓存
+
+新profile使用sampling_mode=cached、rollout_batch_size=8。每卡只加载一份模型，
+独立会话的生成请求在同一GPU batch中推进；旧recompute只作为逐条数值参照。
+采样后仍对整批真实生成token核验old log-prob，不把新前向结果覆盖旧概率。
+
+模型接口复用G0.5原生CachedSession/SparseKVCache和VLM batch forward。各分支
+独立保留KV、卷积/递推状态、原始token、图像/state和RNG。不同长度缓存仅在完整
+注意力的KV左侧补零并屏蔽，线性状态不消费padding；结束后恢复真实缓存长度，
+包含末个EOS。提前结束的行退出batch，不再生成或推进该环境。
+
+phase_steps是单条与批量路径共用的动作/工具/观察实现；run_phases只在生成边界
+调度，GT/事件逐真实步记录。模拟器在owner线程交错step，GPU生成实际合批，
+不将它描述成多进程物理并行。每个sim.render显式激活自己的EGL context，
+避免多个环境交错时读到另一环境的framebuffer；QA分叉像素核验继续保留。
+
+组内动作全部采完，按原规则均匀选一个父经历后才展开QA组；没有按成功筛选。
+生成错误关闭全部回合资源并阻止整组更新。此后端不冒充vLLM/Ray/FSDP Trainer。
+
+分叉复核先逐项要求积分状态、几何和相机变换相等；独立GL上下文的uint8 RGB
+允许每通道一个量化级的舍入差，按same-state-uint8-render-lsb-v1记录max_delta
+及changed_pixels，超过即拒绝。实际QA初始观察仍精确复制父回合原图，不能用
+这份复核渲染替换输入。分叉回执写入qa-N-fork.json，只作私有诊断。
+
+当前部署使用单机4卡L40S。每卡依次采两个任务组，每组最多8条生成请求合批，
+全局采样batch仍是128条阶段序列；mini-batch32，两卡改四卡不改变任务/奖励权重。
+模拟器逐步图提取和API judge仍有CPU/网络开销，不能将token生成提速直接等同于
+整批训练提速。先过真实采样、整批概率核对和梯度更新，再报告实际吞吐。

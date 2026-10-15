@@ -19,12 +19,185 @@ from types import SimpleNamespace
 
 import torch
 
+from verl.experimental.physical_ai.batched_sampling import pack_caches, run_phases, sample_responses, unpack_cache
 from verl.experimental.physical_ai.sampling import fork_chat, sample_response
 from verl.experimental.physical_ai.workspace import configure_workspace
 
 
 class SamplingTests(unittest.TestCase):
-    """保留原测试条件，只变更模块导入与工作区定位。"""
+    """核对原生采样、批量缓存隔离、停止机制和环境渲染精度。"""
+
+    def test_interleaved_environments_activate_own_render_context(self):
+        """交错读图必须先切本实例上下文；替换offscreen context后不继续使用旧对象。"""
+        from verl.experimental.physical_ai.libero_session import bind_render_context
+
+        active = []
+
+        def context(name):
+            """模拟EGL当前上下文，渲染结果取决于最近一次激活。"""
+            return SimpleNamespace(gl_ctx=SimpleNamespace(make_current=lambda: active.append(name)))
+
+        first = SimpleNamespace(_render_context_offscreen=context("a"), render=lambda **kw: (active[-1], kw))
+        second = SimpleNamespace(_render_context_offscreen=context("b"), render=lambda **kw: (active[-1], kw))
+        bind_render_context(first)
+        bind_render_context(second)
+        self.assertEqual(first.render(camera="wrist"), ("a", {"camera": "wrist"}))
+        self.assertEqual(second.render(), ("b", {}))
+        self.assertEqual(first.render(), ("a", {}))
+        first._render_context_offscreen = context("a-new")
+        bind_render_context(first)
+        self.assertEqual(first.render(), ("a-new", {}))
+        self.assertEqual(active, ["a", "b", "a", "a-new"])
+
+    def test_fork_image_quantization_is_bounded_and_does_not_edit_input(self):
+        """允许一个uint8量化级；两级、尺寸变化与错误dtype必须拒绝，原图不修改。"""
+        import numpy as np
+
+        from verl.experimental.physical_ai.libero_session import compare_fork_image
+
+        parent = np.full((4, 4, 3), 128, dtype=np.uint8)
+        child = parent.copy()
+        child[0, 0, 0] += 1
+        before = parent.copy()
+        self.assertEqual(compare_fork_image(parent, child)["changed_pixels"], 1)
+        np.testing.assert_array_equal(parent, before)
+        child[0, 0, 0] += 1
+        with self.assertRaises(ValueError):
+            compare_fork_image(parent, child)
+        with self.assertRaises(ValueError):
+            compare_fork_image(parent, parent.astype(float))
+        with self.assertRaises(ValueError):
+            compare_fork_image(parent, parent[:2])
+
+    def test_packed_cache_keeps_real_history_and_branch_isolation(self):
+        """不同历史长度仅补KV，不向递推状态加虚构步骤；拆出的分支拥有独立存储。"""
+        configure_workspace()
+        from g05.models.kv_cache import SparseKVCache
+
+        caches = []
+        for length in (2, 5):
+            c = SparseKVCache(last_linear_layer=1)
+            c.key_cache[0] = torch.randn(1, 2, length, 3)
+            c.value_cache[0] = torch.randn(1, 2, length, 3)
+            c.conv_states[1] = torch.randn(1, 2, 4)
+            c.recurrent_states[1] = torch.randn(1, 2, 3, 3)
+            c.split_recurrent_states[1] = torch.randn(1, 2, 3, 3)
+            caches.append(c)
+        packed, pads = pack_caches(caches)
+        self.assertEqual(pads, [3, 0])
+        self.assertFalse(bool(packed.key_cache[0][0, :, :3].any()))
+        for i, original in enumerate(caches):
+            restored = unpack_cache(packed, i, pads[i])
+            for field in ("key_cache", "value_cache", "conv_states", "recurrent_states", "split_recurrent_states"):
+                for key, expected in getattr(original, field).items():
+                    torch.testing.assert_close(getattr(restored, field)[key], expected)
+            restored.conv_states[1].zero_()
+            self.assertTrue(bool(original.conv_states[1].abs().sum()))
+            self.assertTrue(bool(packed.conv_states[1][i].abs().sum()))
+
+    def test_batch_early_eos_does_not_advance_finished_branch(self):
+        """短历史分支先EOS退出，另一条继续；KV padding不泄漏且EOS本身被缓存。"""
+        configure_workspace()
+        from g05.models.kv_cache import SparseKVCache
+
+        owner = self
+
+        class VLM:
+            def decode(self, hidden):
+                logits = torch.full((hidden.shape[0], 1, 4), -100.0)
+                for i in range(hidden.shape[0]):
+                    logits[i, 0, 1 if hidden[i, 0, 0] == 0 else 2] = 100
+                return logits
+
+            def embed(self, ids):
+                return ids.float().unsqueeze(-1)
+
+            def __call__(self, **kw):
+                cache = kw["kv_cache"]
+                size = kw["inputs_embeds"].shape[0]
+                if size == 2:
+                    owner.assertTrue(bool((kw["attention_mask"][0, :, :, :3] < 0).all()))
+                    owner.assertTrue(bool((kw["attention_mask"][1] == 0).all()))
+                new = kw["inputs_embeds"].unsqueeze(1)
+                cache.update(new, new, 0)
+                cache.conv_states[1].add_(1)
+                return torch.ones(size, 1, 1), cache
+
+        model = SimpleNamespace(
+            training=False,
+            vlm=VLM(),
+            attn_implementation="test",
+            ar_helper=SimpleNamespace(action_token_range=(2, 4)),
+            cfg=SimpleNamespace(vlm=SimpleNamespace(max_position_embeddings=16)),
+            mask_helper=SimpleNamespace(_sample_step=lambda shape, device: torch.ones(shape, device=device)),
+        )
+
+        class Engine:
+            def __init__(self, length, marker):
+                self.model = model
+                self.ids = torch.zeros(1, length, dtype=torch.long)
+                self.types = torch.full_like(self.ids, 4)
+                self.hidden = torch.tensor([[[float(marker)]]])
+                self.last_position = torch.tensor([[length - 1.0]])
+                self.cache = SparseKVCache(last_linear_layer=1)
+                self.cache.key_cache[0] = torch.zeros(1, 1, length, 1)
+                self.cache.value_cache[0] = torch.zeros(1, 1, length, 1)
+                self.cache.conv_states[1] = torch.zeros(1, 1, 1)
+
+            def append(self, inputs, **kwargs):
+                owner.assertTrue(torch.equal(inputs["input_ids"], self.ids))
+
+        engines = [Engine(2, 0), Engine(5, 1)]
+        requests = [
+            dict(
+                engine=e,
+                inputs={"input_ids": e.ids},
+                max_new_tokens=3,
+                stop_ids=[1],
+                temperature=1.0,
+                generator=torch.Generator().manual_seed(i),
+                mode="cached",
+                compute_dtype="float32",
+            )
+            for i, e in enumerate(engines)
+        ]
+        results = sample_responses(requests)
+        self.assertEqual([r["ids"] for r in results], [[1], [2, 2, 2]])
+        self.assertEqual([e.cache.num_items() for e in engines], [3, 8])
+        self.assertEqual([float(e.cache.conv_states[1].item()) for e in engines], [1.0, 3.0])
+        self.assertEqual([r["termination"] for r in results], ["message_end", "token_budget"])
+
+    def test_phase_scheduler_batches_and_closes_all_on_error(self):
+        """调度保持返回顺序；不同结束长度能汇成batch，失败时所有视频/环境生成器都收尾。"""
+        closed, batches = [], []
+
+        def phase(identity, count):
+            """可变长度的回合，用finally模拟视频资源释放。"""
+            try:
+                for step in range(count):
+                    response = yield dict(identity=identity, step=step)
+                    self.assertEqual(response, identity)
+                return identity
+            finally:
+                closed.append(identity)
+
+        def sample(requests):
+            """记录一次真正收到的batch宽度，避免串行循环伪装batch。"""
+            batches.append(len(requests))
+            return [r["identity"] for r in requests]
+
+        self.assertEqual(run_phases([phase("a", 1), phase("b", 3)], 8, sample_batch=sample), ["a", "b"])
+        self.assertEqual(batches, [2, 1, 1])
+        self.assertCountEqual(closed, ["a", "b"])
+        closed.clear()
+
+        def broken(_):
+            """批次生成失败不得留下其他回合的未关闭资源。"""
+            raise RuntimeError("injected")
+
+        with self.assertRaisesRegex(RuntimeError, "injected"):
+            run_phases([phase("a", 1), phase("b", 3)], 8, sample_batch=broken)
+        self.assertCountEqual(closed, ["a", "b"])
 
     def test_native_observation_import_with_verl_scripts(self):
         """verl普通scripts包存在时仍加载准确G0.5函数，不覆盖框架自己的包。"""

@@ -37,7 +37,7 @@ def chat_fingerprint(chat):
     return h.hexdigest()
 
 
-def collect_phase(
+def phase_steps(
     session,
     chat,
     *,
@@ -57,6 +57,8 @@ def collect_phase(
     session/chat已经包含合法前缀，QA可从完整动作历史副本继续。env_steps是本阶段
     允许的真实20Hz控制/保持步，token_budget为本阶段总生成上限。原生成功不提前停。
     仅正常无工具响应或执行预算耗尽结束阶段；错误工具输出记录为模型错误而不补动作。
+    每个模型调用以yield交给调度器，收到原token/概率后继续实际执行；多个generator
+    可在同一owner线程交错运行，使独立会话的生成请求形成GPU batch。
     未完成消息的生成截断显式抛错，当前诊断不伪造EOS拼接后续回合。
     """
     import imageio.v2 as imageio
@@ -107,9 +109,9 @@ def collect_phase(
             budget = min(token_budget - consumed, int(engine.model.cfg.vlm.max_position_embeddings) - len(chat.ids))
             if budget < 1:
                 raise RuntimeError("native_context_capacity_exhausted")
-            response = sample_response(
-                engine,
-                inputs,
+            response = yield dict(
+                engine=engine,
+                inputs=inputs,
                 max_new_tokens=budget,
                 stop_ids=stop_ids,
                 temperature=1.0,
@@ -231,3 +233,21 @@ def collect_phase(
     finally:
         video.close()
         del engine
+
+
+def collect_phase(*args, **kwargs):
+    """单条诊断兼容入口；与批量模式共用phase_steps，只用旧采样函数处理每次请求。
+
+    不另写第二份动作/状态/问答逻辑。异常会关闭生成器，让其finally释放视频资源。
+    返回值仍为原阶段记录，供旧小试和历史配置复现。
+    """
+    generator = phase_steps(*args, **kwargs)
+    try:
+        request = next(generator)
+        while True:
+            response = sample_response(**request)
+            request = generator.send(response)
+    except StopIteration as finished:
+        return finished.value
+    finally:
+        generator.close()

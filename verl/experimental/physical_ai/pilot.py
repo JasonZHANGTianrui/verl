@@ -42,10 +42,11 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     from libero.libero import benchmark
     from rollout.g05.chat_libero import LiveChat
 
-    from .g05_rollout import chat_fingerprint, collect_phase
+    from .batched_sampling import run_phases
+    from .g05_rollout import chat_fingerprint, phase_steps
     from .libero_session import LiberoSession
     from .online_reward import bind_delivery, save_json, score_answer
-    from .sampling import fork_chat
+    from .sampling import fork_chat, sample_response
     from .seggrpo import Segment, select_parent
     from .task_data import create_scene_capture, open_task_session, state_task_reward
 
@@ -55,10 +56,26 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         suite = benchmark.get_benchmark_dict()[config["suite"]]()
         task_index = next(i for i in range(suite.n_tasks) if suite.get_task(i).name == config["task_name"])
     records, artifacts, parents = [], [], []
+    batch_size = config.get("rollout_batch_size", 1)
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("rollout_batch_size须为正整数")
+    if batch_size > 1 and config["sampling_mode"] != "cached":
+        raise ValueError("组内批量生成要求已经验收的缓存模式")
+
+    def drive(generators):
+        """串行旧配置与批量新配置共用物理/评分生成器，仅选择生成请求的计算后端。"""
+        if config["sampling_mode"] == "cached":
+            return run_phases(generators, batch_size)
+        return run_phases(generators, 1, sample_batch=lambda requests: [sample_response(**r) for r in requests])
+
     # 所有父环境保留到选中一个，再为每条QA建立独立副本；退出后统一释放再训练。
     with ExitStack() as stack:
         initial_digest = None
-        for i in range(config["execution_group_size"]):
+        finished_execution = 0
+
+        def execution(i):
+            """一条真实动作分支；首次yield前初始化独立场景，结束后冻结该分支的GT。"""
+            nonlocal initial_digest, finished_execution
             rollout_id = f"execution-{i}"
             session = stack.enter_context(
                 open_task_session(
@@ -108,7 +125,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             chat.rl_compute_dtype = config["compute_dtype"]
             chat.start(session.task, build_libero_raw_obs(session.observation, session.task)[0])
             directory = output / rollout_id
-            phase = collect_phase(
+            phase = yield from phase_steps(
                 session,
                 chat,
                 phase="execution",
@@ -147,21 +164,39 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 reward,
                 "scored",
             )
-            records.append(record)
             phase["inputs_path"] = str(directory / "inputs.pt")
-            artifacts.append(phase)
-            parents.append((session, chat, phase, binding))
             save_json(
                 directory / "reward.json",
                 dict(**task_result, binding=binding, native_success=session.audit()["native_success"]),
             )
+            finished_execution += 1
             save_json(
                 output / "progress.json",
-                dict(phase="execution", finished=i + 1, planned=config["execution_group_size"]),
+                dict(phase="execution", finished=finished_execution, planned=config["execution_group_size"]),
             )
+            return record, phase, (session, chat, phase, binding)
+
+        for start in range(0, config["execution_group_size"], batch_size):
+            results = drive(execution(i) for i in range(start, min(start + batch_size, config["execution_group_size"])))
+            for record, phase, parent in results:
+                records.append(record)
+                artifacts.append(phase)
+                parents.append(parent)
         selected = select_parent(records, seed=config["seed"], mode="uniform")
         parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
         session, chat, phase, binding = parents[parent_index]
+        # 未选中的真实轨迹/GT已经落盘，之后不再执行这些环境；及时释放其EGL资源。
+        # 只关闭环境，不删除原会话/动作记录，也不按奖励改变父轨迹选择。
+        for index, parent in enumerate(parents):
+            if index != parent_index:
+                parent[0].close()
+        # 渲染器的显存不归PyTorch allocator管理；归还空闲块供接下来的QA副本使用。
+        import gc
+
+        import torch
+
+        gc.collect()
+        torch.cuda.empty_cache()
         base_chat = fork_chat(chat)
         base_chat.question(question["question"], pending_assistant=phase["pending_assistant"])
         prefix_hash = chat_fingerprint(base_chat)
@@ -180,14 +215,19 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         client = JudgeClient(
             Path(os.environ["PHYSICAL_AI_JUDGE_ACCESS_FILE"]), model=config["judge_model"], timeout_s=90
         )
-        for i in range(config["qa_group_size"]):
+        finished_qa = 0
+
+        def qa(i):
+            """同一真实父经历下的独立QA分支；冻结GT共用，生成和后续动作各自独立。"""
+            nonlocal finished_qa
             child_id = f"qa-{i}"
             with session.fork() as child:
                 child_chat = fork_chat(base_chat)
                 if chat_fingerprint(child_chat) != prefix_hash:
                     raise ValueError("QA分支会话前缀不同")
                 directory = output / child_id
-                answer = collect_phase(
+                save_json(output / f"{child_id}-fork.json", child.fork_validation)
+                answer = yield from phase_steps(
                     child,
                     child_chat,
                     phase="qa",
@@ -202,27 +242,34 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 save_json(directory / "judge.json", judgment)
                 if judgment["status"] != "scored":
                     raise ValueError("judge未给有效分数，整个组保留待恢复，禁止更新")
-                records.append(
-                    Segment(
-                        child_id,
-                        "qa",
-                        "qa-group",
-                        qa_condition,
-                        config["case_id"],
-                        policy_version,
-                        config["qa_group_size"],
-                        answer["prefix_length"] - 1,
-                        answer["end_length"] - 1,
-                        float(judgment["score"]),
-                        "scored",
-                        parent_rollout_id=selected,
-                    )
+                record = Segment(
+                    child_id,
+                    "qa",
+                    "qa-group",
+                    qa_condition,
+                    config["case_id"],
+                    policy_version,
+                    config["qa_group_size"],
+                    answer["prefix_length"] - 1,
+                    answer["end_length"] - 1,
+                    float(judgment["score"]),
+                    "scored",
+                    parent_rollout_id=selected,
                 )
                 answer["inputs_path"] = str(directory / "inputs.pt")
-                artifacts.append(answer)
-                save_json(output / "progress.json", dict(phase="qa", finished=i + 1, planned=config["qa_group_size"]))
+                finished_qa += 1
+                save_json(
+                    output / "progress.json", dict(phase="qa", finished=finished_qa, planned=config["qa_group_size"])
+                )
                 if chat_fingerprint(base_chat) != prefix_hash:
                     raise ValueError("子分支改动了父会话")
+                return record, answer
+
+        for start in range(0, config["qa_group_size"], batch_size):
+            results = drive(qa(i) for i in range(start, min(start + batch_size, config["qa_group_size"])))
+            for record, answer in results:
+                records.append(record)
+                artifacts.append(answer)
         save_json(output / "groups.json", [asdict(r) for r in records])
     return records, artifacts
 

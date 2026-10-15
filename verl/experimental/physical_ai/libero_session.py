@@ -23,6 +23,49 @@ from copy import deepcopy
 import numpy as np
 
 
+def bind_render_context(sim):
+    """给本实例render绑定自己的EGL context，允许同一线程交错使用多个模拟器。
+
+    当前robosuite的sim.render没有在每次调用前make_current；创建第二个环境后，
+    第一环境可能误用第二个环境的OpenGL framebuffer/纹理。只包裹该sim实例，
+    不改上游或渲染参数；每次读取实际offscreen context，避免XML重建后沿用旧引用。
+    """
+    if getattr(sim, "_physical_ai_render_bound", False):
+        return
+    original = sim.render
+
+    def render(*args, **kwargs):
+        """先激活本模拟器上下文，再原样执行相机/分割读取。"""
+        sim._render_context_offscreen.gl_ctx.make_current()
+        return original(*args, **kwargs)
+
+    sim.render = render
+    sim._physical_ai_render_bound = True
+
+
+def compare_fork_image(parent, child):
+    """在原生uint8精度下核对同一物理状态的独立渲染，返回私有差异记录。
+
+    独立GL上下文可在量化边界出现1个灰度级的舍入差；只接受每通道绝对差≤1。
+    此函数仅在完整积分状态、几何及相机变换已逐项相等后调用，不用于放宽GT或
+    比较不同物理状态。初始QA仍复制父回合原始观察，不能用这张复核图替换输入。
+    """
+    parent, child = np.asarray(parent), np.asarray(child)
+    if parent.dtype != np.uint8 or child.dtype != np.uint8 or parent.shape != child.shape:
+        raise ValueError("分叉图像必须具有相同uint8形状")
+    if parent.ndim != 3 or parent.shape[-1] != 3 or not parent.size:
+        raise ValueError("分叉图像必须为非空RGB数组")
+    difference = np.abs(parent.astype(np.int16) - child.astype(np.int16))
+    result = dict(
+        max_delta=int(difference.max()),
+        changed_pixels=int(np.any(difference, axis=-1).sum()),
+        rule="same-state-uint8-render-lsb-v1",
+    )
+    if result["max_delta"] > 1:
+        raise ValueError(f"分叉渲染差异超出1个uint8量化级：{result}")
+    return result
+
+
 class LiberoSession:
     """一条rollout拥有一个环境，多次动作调用共享同一物理状态。
 
@@ -99,6 +142,7 @@ class LiberoSession:
                 self.env.env.sim.reset()
                 self.observation = self.env.set_init_state(initial_condition.simulator_states[0])
                 synchronize_controller_observation(self.env)
+            bind_render_context(self.env.env.sim)
             self.last_action = np.array([0.0] * 6 + [-1.0])
         except BaseException:
             self.close()
@@ -211,9 +255,30 @@ class LiberoSession:
                 child.env.env.sim.get_state().flatten(),
             ):
                 raise ValueError("分支物理状态与父轨迹不同")
-            for camera in ["agentview_image", "robot0_eye_in_hand_image"]:
-                if not np.array_equal(parent_current[camera], child_current[camera]):
-                    raise ValueError("分支初始图与父轨迹末图不同：" + camera)
+            # 积分状态之外也核对实际用于绘制的几何/相机变换；不拿渲染容差掩盖位姿不同。
+            for name in (
+                "body_xpos",
+                "body_xmat",
+                "geom_xpos",
+                "geom_xmat",
+                "site_xpos",
+                "site_xmat",
+                "cam_xpos",
+                "cam_xmat",
+                "light_xpos",
+                "light_xdir",
+            ):
+                if not np.array_equal(getattr(self.env.sim.data, name), getattr(child.env.sim.data, name)):
+                    raise ValueError("分支渲染变换与父轨迹不同：" + name)
+            child.fork_validation = dict(
+                physical_state_equal=True,
+                render_transforms_equal=True,
+                initial_observation="exact_parent_copy",
+                cameras={
+                    camera: compare_fork_image(parent_current[camera], child_current[camera])
+                    for camera in ["agentview_image", "robot0_eye_in_hand_image"]
+                },
+            )
             return child
         except BaseException:
             if child is not None:
@@ -241,6 +306,10 @@ class LiberoSession:
             raise RuntimeError("只能在创建会话的worker中关闭环境")
         self.closed = True
         if self.env is not None:
+            # 释放MuJoCo的GL资源也必须在其创建上下文内，不能污染仍存活的其他分支。
+            context = getattr(getattr(self.env.env, "sim", None), "_render_context_offscreen", None)
+            if context is not None:
+                context.gl_ctx.make_current()
             self.env.close()
 
     def __enter__(self):

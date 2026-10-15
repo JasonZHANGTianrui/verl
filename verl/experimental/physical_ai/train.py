@@ -129,8 +129,8 @@ def main():
     failed = False
     try:
         config = runtime_config
-        if config["sampling_mode"] != "recompute" or config["compute_dtype"] != "float32":
-            raise ValueError("此后端仅启用已通过完整轨迹概率验收的FP32重算")
+        if config["sampling_mode"] not in {"recompute", "cached"} or config["compute_dtype"] != "float32":
+            raise ValueError("此后端仅启用FP32原生重算或经完整轨迹概率核验的缓存采样")
         algorithm = validate_fixed_algorithm(config)
         if config["optimizer"] not in {"sgd", "adamw"}:
             raise ValueError("需要合法优化器及正数任务组预算")
@@ -232,7 +232,12 @@ def main():
                     critic=False,
                     entropy_computed=False,
                     actor_backend="native_torch_zero1" if config.get("optimizer_state_sharding") else "native_torch",
-                    sampling_backend="native_g05_full_prefix_recompute",
+                    sampling_backend=(
+                        "native_g05_batched_cached"
+                        if config["sampling_mode"] == "cached"
+                        else "native_g05_full_prefix_recompute"
+                    ),
+                    rollout_batch_size=config.get("rollout_batch_size", 1),
                 )
                 save_json(args.output / "effective-config.json", tracker_config)
                 tracker = make_tracker(tracker_config, args.output, args.swanlab_key_file)
