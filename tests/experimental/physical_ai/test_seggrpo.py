@@ -22,6 +22,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.physical_ai.batching import minibatch_indices, namespace_group, prepare_batch
 from verl.experimental.physical_ai.seggrpo import Segment, segment_advantages, segmented_policy_loss, select_parent
+from verl.experimental.physical_ai.training_metrics import rollout_metrics, update_metrics
 
 
 def fixture():
@@ -53,6 +54,26 @@ def fixture():
 
 class SegGRPOTests(unittest.TestCase):
     """针对分组、反向和选择偏置测试，而不是只验证字段名字。"""
+
+    def test_metrics_preserve_zero_groups_and_exclude_qa_prefix(self):
+        """零优势仍计入总体奖励；QA长度/优势只取QA阶段，日志函数不修改准备数据。"""
+        records, mask = fixture()
+        records = [replace(r, reward=1) if r.phase == "qa" else r for r in records]
+        artifacts = [dict(generated=[False] + m.tolist(), old_logprobs=[0.0] + [-2.0] * len(m)) for m in mask]
+        prepared = prepare_batch(records, artifacts)
+        original = prepared["advantages"].clone()
+        metrics = rollout_metrics(records, artifacts, prepared)
+        self.assertEqual(metrics["rollout/execution/reward_mean"], 0.5)
+        self.assertEqual(metrics["rollout/qa/reward_mean"], 1)
+        self.assertEqual(metrics["rollout/qa/zero_variance_group_fraction"], 1)
+        self.assertEqual(metrics["rollout/qa/phase_tokens_mean"], 3)
+        self.assertEqual(metrics["rollout/qa/old_sampled_nll"], 2)
+        self.assertEqual(metrics["rollout/qa/advantage_abs_mean"], 0)
+        torch.testing.assert_close(prepared["advantages"], original)
+        skipped = update_metrics(dict(optimizer_step=False), records, list(range(4)))
+        self.assertEqual(skipped["actor/policy_loss"], 0)
+        self.assertNotIn("actor/grad_norm", skipped)
+        self.assertNotIn("actor/qa/active_ppo_kl", skipped)
 
     def test_complete_task_minibatches_and_frozen_advantages(self):
         """128条按8＋8完整任务切成四个32条mini；缺QA、拆任务和混策略均拒绝。"""

@@ -12,9 +12,9 @@
 | `episode_agent_loop.py` | 沿官方工具循环维护整回合的有状态工具 |
 | `sampling.py`、`g05_rollout.py` | 原生token采样、完整前缀和实际动作执行 |
 | `g05_logprobs.py`、`precision.py` | 动作／文字概率与FP32参考路径 |
-| `native_update.py` | 原生模型的单组SGD更新诊断 |
+| `native_update.py` | 原生模型的mini-batch更新；旧无优化器入口保留SGD诊断 |
 | `pilot.py`、`distributed_update.py` | 真实4＋4小组、跨区采样附件核验及更新入口 |
-| `train.py`、`training_state.py` | 原生后端连续训练、全局梯度、组边界保存/恢复及verl日志 |
+| `train.py`、`training_state.py`、`training_metrics.py` | 连续训练、批次保存/恢复/保留策略及两阶段日志 |
 | `workspace.py` | 定位独立的Physical AI工作区，不靠submodule目录层数 |
 | `configs/` | 本接入的loop、奖励契约和开发case配置 |
 
@@ -104,14 +104,15 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
   --swanlab-key-file /path/to/private/key.txt --output /path/to/new-training-run
 ```
 
-每组完成后保存完整policy、优化器、训练游标、数据/配置身份及各rank随机状态。
+按save_freq个完整采样batch保存完整policy、优化器、训练游标、数据/配置身份及各rank随机状态。
+正常结束或显式边界停止也保存；未配置save_freq的旧profile仍每批保存。
 `--resume /path/to/checkpoints/group-N/checkpoint.json`配合新output目录恢复；改变任务、
 配置或world size会拒绝。半组不能续接成旧物理经历，旧attempt目录保留，重新采样
 使用新目录。checkpoint先原子落盘并hash，最后写manifest，不接受半份文件。
 
 SwanLab走verl原生`Tracking`；密钥只从私有文件进入进程环境，不写配置和checkpoint。
-只上报动作/QA奖励、有效更新数、零方差组、概率误差、梯度范数和耗时，不上传私有
-轨迹或GT。`swanlab.json`给出云端入口，`progress.json`与逐group日志保留本地进度。
+上报完整生效配置及两阶段奖励、优势、有效组、策略loss、clip比例、策略变化、
+真实token长度、梯度范数、学习率、显存和分阶段耗时，不上传私有轨迹或GT。`swanlab.json`给出云端入口，`progress.json`与逐group日志保留本地进度。
 此profile未加reference KL；全部同分的组仍为零优势，不能据此重采制造奖励差异。
 
 ### Batch 128、mini-batch 32、两阶段n=8
@@ -119,8 +120,9 @@ SwanLab走verl原生`Tracking`；密钥只从私有文件进入进程环境，�
 配置为`configs/sft-task-b128-m32-n8.json`。每个采样batch包含8个任务，每任务8条
 动作轨迹，加上从中均匀选一父经历后的8条QA；共128条阶段序列。每个mini-batch
 包含2个完整任务，共32条序列。两卡各以micro-batch 1累积最多16次反向，每批1个
-PPO epoch，最多4次更新。初次启动max_groups=16，即2个采样batch、最多8次更新；
-这里groups计任务记录，不能把它误解成16个128序列的batch。
+PPO epoch，最多4次更新。total_training_steps=100按采样batch计，共800个任务组、
+12,800条阶段序列、最多400次更新；不是100个epoch。旧max_groups按任务记录计，
+与新total_training_steps互斥，防止计数单位混用。
 
 `batching.py`在更新前一次性固定各任务/阶段的优势和原始old log-prob，并给响应
 身份加任务前缀。全部同版行为概率先核对，包括零优势组；后续mini-batch产生的
@@ -133,8 +135,10 @@ PPO epoch，最多4次更新。初次启动max_groups=16，即2个采样batch、
 
 两个rank分别采完整任务，同一任务的环境/动作/QA仍在同一进程串行，EGL按本rank
 GPU绑定。任何任务失败于资源、GT或接口时拒绝整个采样batch，不缩组。保存/停止
-必须在完整采样batch边界：此配置`--stop-after-groups 8`跑完首批，再从
-`checkpoints/group-000008/checkpoint.json`在新目录恢复余下8个任务。
+必须在完整采样batch边界。save_freq=10每10批保存，max_ckpt_to_keep=1只保留
+本输出目录最新完整checkpoint；新权重、完整优化器和manifest落盘并更新latest后
+才清理旧版本。源checkpoint、其他实验和GPU验收文件不清理。恢复需要新output目录，
+外部恢复源不自动删除；断点前尚未保存的批次须重新采样。
 
 仍只接入配置指定的已验证任务奖励，模板、相机、稳定等待和完整会话不因batch改变。
 
@@ -149,3 +153,19 @@ python -m unittest discover -s data-pipeline/ours/tests -p 'test_rl*.py' -v
 ```
 
 fork测试核对概率、采样、分组及两进程梯度；数据侧测试负责转换、资源和切分；fork测试同时核对GT隔离、裁判错误及环境副本。真实仿真和真实模型诊断单独记录，不拿单元测试代替训练收益。
+
+### 算法配置与观测口径
+
+当前明确采用组内标准差归一化、动作与QA阶段等权相加、seq-mean-token-mean，
+clip_ratio=0.2和verl vanilla实现的dual-clip界限clip_ratio_c=3。完整词表采样温度1，
+不做top-k/top-p截断；rollout与actor分布相同，先整批检查old log-prob，再做四个mini更新。
+参考模型KL与熵奖励关闭；学习率固定1e-6，无warmup，无critic。这些值显式上传
+SwanLab；当前原生后端不支持的开关设成其他值会报错，不能只改配置制造已启用假象。
+参考：[verl GRPO](https://verl.readthedocs.io/en/latest/algo/grpo.html)、
+[官方配置](https://verl.readthedocs.io/en/latest/examples/config.html)。
+
+日志横轴为mini-batch尝试数，另有sampling_batch与实际optimizer_steps；全零优势
+mini不更新参数，但仍记录奖励与采样进度。rollout指标覆盖包括零优势组的整个batch；
+actor的active_clip/ratio/old_policy_k3只统计真正反向的响应。old_policy_k3是相对
+采样旧策略的诊断，不能当reference KL。old_sampled_nll也不是完整词表精确entropy。
+当前不宣称有定期独立验证集测评；训练奖励不能替代benchmark成绩。

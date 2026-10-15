@@ -17,11 +17,110 @@
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 import torch
 
 from .online_reward import save_json
+
+
+def training_budget(config, tasks_per_batch):
+    """返回计划任务数；新接口按采样batch计，旧max_groups仍按任务数计。
+
+    两种预算不能同时提供。整数/整除检查避免100被误当100个mini-batch或100个
+    epoch；当前采样器按固定训练记录列表循环，新种子产生新的真实rollout。
+    """
+    keys = [k for k in ("total_training_steps", "max_groups") if k in config]
+    if len(keys) != 1 or type(config[keys[0]]) is not int or config[keys[0]] < 1:
+        raise ValueError("必须提供唯一的正整数total_training_steps或旧max_groups")
+    total = config[keys[0]] * tasks_per_batch if keys[0] == "total_training_steps" else config[keys[0]]
+    if tasks_per_batch < 1 or total % tasks_per_batch:
+        raise ValueError("任务预算须能构成完整采样batch")
+    return total
+
+
+def validate_fixed_algorithm(config):
+    """核对尚固定的算法选项；显式填写不支持的值必须报错，不能只上传参数但忽略它。
+
+    这些值对应当前已验证路径：标准组内标准差归一化、阶段等权、完整词表温度1
+    采样、固定学习率且无reference KL/熵奖励。未来实现新路径时同步扩展校验。
+    """
+    fixed = dict(
+        advantage_estimator="seggrpo",
+        norm_adv_by_std_in_grpo=True,
+        advantage_epsilon=1e-6,
+        loss_agg_mode="seq-mean-token-mean",
+        execution_loss_weight=1.0,
+        qa_loss_weight=1.0,
+        parent_selection="uniform",
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+        use_kl_loss=False,
+        kl_loss_coef=0.0,
+        entropy_coeff=0.0,
+        lr_scheduler_type="constant",
+        lr_warmup_steps=0,
+    )
+    for key, value in fixed.items():
+        if config.get(key, value) != value:
+            raise ValueError(f"当前原生后端尚不支持{key}={config[key]!r}")
+    return fixed
+
+
+def checkpoint_due(completed_batches, save_freq, *, final=False):
+    """按完整采样batch计保存周期；正常结束或显式边界停止也保存，不按mini更新计数。
+
+    completed_batches从1开始，save_freq必须为正整数。即使该批全零优势、没有参数
+    更新，采样游标也已推进，因此仍按采样批数判断；异常中断不伪造最终checkpoint。
+    """
+    if type(save_freq) is not int or save_freq < 1 or completed_batches < 1:
+        raise ValueError("保存频率及已完成batch数须为正整数")
+    return final or completed_batches % save_freq == 0
+
+
+def prune_checkpoints(root, latest, keep):
+    """新checkpoint和latest发布成功后，仅清理本输出目录的旧完整checkpoint。
+
+    keep为正整数或None（不清理）。只接受同一训练契约、路径位于root直接子目录的
+    checkpoint；跳过临时文件、符号链接和外部恢复源。最新checkpoint须已存在，
+    防止新保存失败时先删除唯一恢复点。删除不涉及源权重、GPU验收或其他实验目录。
+    """
+    if keep is None:
+        return []
+    if type(keep) is not int or keep < 1:
+        raise ValueError("max_ckpt_to_keep须为正整数或null")
+    root = Path(root).resolve()
+    newest = Path(latest["path"])
+    if newest.parent.parent.resolve() != root or not newest.is_file():
+        raise ValueError("新checkpoint未完整保存于本次输出目录")
+    published = json.loads((newest.parent / "checkpoint.json").read_text())
+    if published != latest:
+        raise ValueError("新checkpoint的发布凭据不一致")
+    candidates = []
+    for directory in root.glob("group-*"):
+        manifest = directory / "checkpoint.json"
+        if directory.is_symlink() or not manifest.is_file() or manifest.is_symlink():
+            continue
+        receipt = json.loads(manifest.read_text())
+        target = Path(receipt["path"])
+        if (
+            receipt["contract"] == latest["contract"]
+            and target == directory / "training.pt"
+            and target.is_file()
+            and not target.is_symlink()
+            and receipt["completed_groups"] <= latest["completed_groups"]
+        ):
+            candidates.append((receipt["completed_groups"], directory))
+    candidates.sort(reverse=True)
+    removed = []
+    for _, directory in candidates[keep:]:
+        if directory == newest.parent:
+            raise ValueError("保留排序异常，拒绝删除刚发布的checkpoint")
+        shutil.rmtree(directory)
+        removed.append(str(directory))
+    return removed
 
 
 def build_optimizer(model, config, *, distributed=False):

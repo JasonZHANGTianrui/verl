@@ -41,8 +41,9 @@ def update_once(
     indices=None,
     enforce_on_policy=True,
     clip_ratio=0.2,
+    clip_ratio_c=3.0,
 ):
-    """收齐组后逐条重算、累积两阶段GRPO梯度，执行一次无动量SGD并记录真实变化。
+    """收齐组后逐条重算、累积两阶段GRPO梯度，执行一次优化器更新并记录真实变化。
 
     先在完整组计算优势，每条loss按其阶段样本数缩放；不在micro-batch内重新归一化。
     使用SGD仅为32GB单卡的无优化器状态诊断；不定义正式训练优化器，不改原checkpoint。
@@ -85,7 +86,13 @@ def update_once(
         return result
     phase_sizes = {phase: sum(r.phase == phase for r in selected_records) for phase in ["execution", "qa"]}
     config = OmegaConf.create(
-        dict(clip_ratio=clip_ratio, clip_ratio_low=None, clip_ratio_high=None, clip_ratio_c=3.0, global_batch_info={})
+        dict(
+            clip_ratio=clip_ratio,
+            clip_ratio_low=None,
+            clip_ratio_high=None,
+            clip_ratio_c=clip_ratio_c,
+            global_batch_info={},
+        )
     )
     model.train()
     model.vlm.gradient_checkpointing_enable()
@@ -123,6 +130,17 @@ def update_once(
             error = (logprobs.detach() - old[i : i + 1, :n].cuda())[mask].abs()
             metrics["behavior_logprob_delta_max"] = float(error.max())
             metrics["behavior_logprob_delta_mean"] = float(error.mean())
+            # 仅统计实际参与反向的阶段token；QA父轨迹不混入长度或策略变化指标。
+            delta = (logprobs.detach() - old[i : i + 1, :n].cuda())[mask]
+            ratio = delta.clamp(-20, 20).exp()
+            metrics.update(
+                phase_tokens=int(mask.sum()),
+                policy_loss=float(value.detach()),
+                ratio_mean=float(ratio.mean()),
+                ratio_min=float(ratio.min()),
+                ratio_max=float(ratio.max()),
+                old_policy_k3=float((ratio - 1 - delta.clamp(-20, 20)).mean()),
+            )
             if enforce_on_policy:
                 metrics["rollout_actor_max_logprob_error"] = float(error.max())
                 metrics["rollout_actor_mean_logprob_error"] = float(error.mean())

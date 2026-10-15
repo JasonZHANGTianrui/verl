@@ -22,9 +22,13 @@ import torch
 
 from verl.experimental.physical_ai.training_state import (
     build_optimizer,
+    checkpoint_due,
     load_boundary,
+    prune_checkpoints,
     restore_optimizer,
     save_boundary,
+    training_budget,
+    validate_fixed_algorithm,
 )
 
 
@@ -84,6 +88,66 @@ def _zero_adam_worker(rank, directory):
 
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
+
+    def test_batch_budget_and_safe_retention(self):
+        """100批按10批保存；新写入失败不能删旧恢复点，keep=1不碰其他实验/未完成文件。"""
+        self.assertEqual(training_budget(dict(total_training_steps=100), 8), 800)
+        self.assertEqual(training_budget(dict(max_groups=16), 8), 16)
+        with self.assertRaises(ValueError):
+            training_budget(dict(total_training_steps=100, max_groups=16), 8)
+        due = [i for i in range(1, 101) if checkpoint_due(i, 10, final=i == 100)]
+        self.assertEqual(due, list(range(10, 101, 10)))
+        self.assertTrue(checkpoint_due(13, 10, final=True))
+        model = torch.nn.Linear(2, 1)
+        opt = torch.optim.AdamW(model.parameters())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = None
+            for i in due:
+                target = root / f"group-{i * 8:06d}"
+                receipt = save_boundary(
+                    model,
+                    opt,
+                    target,
+                    completed_groups=i * 8,
+                    optimizer_steps=i * 4,
+                    contract={"run": "new"},
+                    rng_states=[],
+                )
+                if previous:
+                    # 构造未完成的新存档，不能用它触发清理。
+                    broken = dict(receipt, path=str(root / "missing/training.pt"))
+                    with self.assertRaises(ValueError):
+                        prune_checkpoints(root, broken, 1)
+                    self.assertTrue(previous.is_file())
+                prune_checkpoints(root, receipt, 1)
+                self.assertEqual(len(list(root.glob("group-*/checkpoint.json"))), 1)
+                previous = target / "training.pt"
+            foreign = save_boundary(
+                model,
+                opt,
+                root / "group-000001",
+                completed_groups=1,
+                optimizer_steps=1,
+                contract={"run": "other"},
+                rng_states=[],
+            )
+            (root / "group-incomplete").mkdir()
+            (root / "group-link").symlink_to(root / "group-000001", target_is_directory=True)
+            prune_checkpoints(root, receipt, 1)
+            self.assertTrue(Path(foreign["path"]).exists())
+            self.assertTrue((root / "group-incomplete").is_dir())
+            self.assertTrue((root / "group-link").is_symlink())
+            state, _ = load_boundary(root / "group-000800/checkpoint.json", {"run": "new"})
+            self.assertEqual(state["optimizer_steps"], 400)
+
+    def test_unsupported_algorithm_switch_is_not_silently_ignored(self):
+        """SwanLab配置必须对应实际实现，不能填了KL或其他采样分布却不执行。"""
+        config = validate_fixed_algorithm({})
+        self.assertEqual(config["advantage_estimator"], "seggrpo")
+        for change in (dict(use_kl_loss=True), dict(entropy_coeff=0.01), dict(temperature=0.7)):
+            with self.assertRaises(ValueError):
+                validate_fixed_algorithm(change)
 
     def test_zero_adam_matches_reference_after_resume(self):
         """优化器状态分片/同步及重载不能改变AdamW实际数值更新。"""

@@ -87,13 +87,18 @@ def main():
     from .pilot import collect_group
     from .precision import stable_delta_precision
     from .task_data import load_task_release
+    from .training_metrics import rollout_metrics, update_metrics
     from .training_state import (
         build_optimizer,
+        checkpoint_due,
         content_hash,
         load_boundary,
         make_tracker,
+        prune_checkpoints,
         restore_optimizer,
         save_boundary,
+        training_budget,
+        validate_fixed_algorithm,
     )
 
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -118,7 +123,8 @@ def main():
         config = runtime_config
         if config["sampling_mode"] != "recompute" or config["compute_dtype"] != "float32":
             raise ValueError("此后端仅启用已通过完整轨迹概率验收的FP32重算")
-        if config["optimizer"] not in {"sgd", "adamw"} or config["max_groups"] < 1:
+        algorithm = validate_fixed_algorithm(config)
+        if config["optimizer"] not in {"sgd", "adamw"}:
             raise ValueError("需要合法优化器及正数任务组预算")
         if min(config["execution_group_size"], config["qa_group_size"]) < 2:
             raise ValueError("GRPO两组均须至少两条")
@@ -131,11 +137,16 @@ def main():
             or mini_size % width
             or batch_size % mini_size
             or tasks_per_batch < 1
-            or config["max_groups"] % tasks_per_batch
             or config.get("micro_batch_size_per_gpu", 1) != 1
             or config.get("ppo_epochs", 1) != 1
         ):
             raise ValueError("batch/mini-batch须由完整任务组组成；当前micro-batch及PPO epochs固定1")
+        max_groups = training_budget(config, tasks_per_batch)
+        save_freq = config.get("save_freq", 1)
+        keep = config.get("max_ckpt_to_keep")
+        checkpoint_due(1, save_freq)
+        if keep is not None and (type(keep) is not int or keep < 1):
+            raise ValueError("max_ckpt_to_keep须为正整数或null")
         if args.stop_after_groups and args.stop_after_groups % tasks_per_batch:
             raise ValueError("停止点必须在完整采样batch边界")
         random.seed(config["seed"] + rank)
@@ -192,7 +203,28 @@ def main():
                         resume=str(args.resume),
                     ),
                 )
-                tracker = make_tracker(config, args.output, args.swanlab_key_file)
+                tracker_config = dict(config, **{k: v for k, v in algorithm.items() if k not in config})
+                tracker_config["runtime"] = dict(
+                    world_size=world,
+                    tasks_per_batch=tasks_per_batch,
+                    sequences_per_task=width,
+                    mini_batches_per_batch=batch_size // mini_size,
+                    max_micro_batches_per_rank=mini_size // world,
+                    total_sampling_batches=max_groups // tasks_per_batch,
+                    max_optimizer_steps=max_groups // tasks_per_batch * (batch_size // mini_size),
+                    eligible_tasks=len(eligible),
+                    source_tasks=len(rows),
+                    source_checkpoint_sha256=contract["source_checkpoint_sha256"],
+                    tasks_sha256=contract["tasks_sha256"],
+                    save_freq_unit="sampling_batch",
+                    reference_model=False,
+                    critic=False,
+                    entropy_computed=False,
+                    actor_backend="native_torch_zero1" if config.get("optimizer_state_sharding") else "native_torch",
+                    sampling_backend="native_g05_full_prefix_recompute",
+                )
+                save_json(args.output / "effective-config.json", tracker_config)
+                tracker = make_tracker(tracker_config, args.output, args.swanlab_key_file)
                 if "swanlab" in tracker.logger:
                     import swanlab
 
@@ -214,11 +246,7 @@ def main():
             restore_optimizer(optimizer, restored["optimizer_state_dict"])
             restore_rng(restored["rng_states"][rank])
             del restored
-        last_group = (
-            min(config["max_groups"], completed + args.stop_after_groups)
-            if args.stop_after_groups
-            else config["max_groups"]
-        )
+        last_group = min(max_groups, completed + args.stop_after_groups) if args.stop_after_groups else max_groups
         if completed % tasks_per_batch:
             raise ValueError("恢复点不是完整采样batch边界")
         for group_index in range(completed, last_group, tasks_per_batch):
@@ -234,7 +262,7 @@ def main():
                         batch=batch_index,
                         completed_groups=group_index,
                         tasks_per_batch=tasks_per_batch,
-                        planned_groups=config["max_groups"],
+                        planned_groups=max_groups,
                         optimizer_steps=updates,
                     ),
                 )
@@ -300,7 +328,10 @@ def main():
             artifacts = [a for t in collected for a in t["artifacts"]]
             if len(records) != batch_size:
                 raise ValueError("实际序列数不等于配置batch_size")
+            sampling_seconds = time.monotonic() - started
             prepared = prepare_batch(records, artifacts)
+            batch_metrics = rollout_metrics(records, artifacts, prepared)
+            validation_started = time.monotonic()
             minis = minibatch_indices(records, mini_size)
             if rank == 0:
                 from dataclasses import asdict
@@ -324,7 +355,9 @@ def main():
                 distributed=world > 1,
                 max_error=config.get("behavior_logprob_tolerance", 0.05),
             )
+            validation_seconds = time.monotonic() - validation_started
             for mini_index, indices in enumerate(minis):
+                update_started = time.monotonic()
                 rank_dir = directory / f"mini-{mini_index:02d}" / f"rank-{rank}"
                 rank_dir.mkdir(parents=True)
                 if rank == 0:
@@ -352,42 +385,64 @@ def main():
                     indices=indices,
                     enforce_on_policy=False,
                     clip_ratio=config.get("clip_ratio", 0.2),
+                    clip_ratio_c=config.get("clip_ratio_c", 3.0),
                 )
                 updates += int(result["optimizer_step"])
                 if rank == 0:
-                    metrics = {
-                        f"reward/{phase}": sum(records[i].reward for i in indices if records[i].phase == phase)
-                        / sum(records[i].phase == phase for i in indices)
-                        for phase in ("execution", "qa")
-                    }
-                    rows_metrics = result.get("rows", [])
+                    metrics = dict(batch_metrics)
+                    metrics.update(update_metrics(result, records, indices))
                     metrics.update(
                         {
+                            "train/sampling_batch": batch_index + 1,
+                            "train/mini_batch": mini_index + 1,
                             "train/optimizer_steps": updates,
-                            "train/zero_variance_groups": result["zero_variance_groups"],
+                            "train/task_records_seen": group_index + tasks_per_batch,
+                            "train/data_passes": (group_index + tasks_per_batch) / len(eligible),
+                            "train/learning_rate": optimizer.param_groups[0]["lr"],
                             "train/behavior_check_max_error": parity["max_error"],
-                            "train/behavior_logprob_delta_max": max(
-                                (r["behavior_logprob_delta_max"] for r in rows_metrics), default=0
-                            ),
-                            "train/clip_fraction": sum(r.get("actor/pg_clipfrac", 0) for r in rows_metrics)
-                            / max(1, len(rows_metrics)),
-                            "train/grad_norm": result.get("grad_norm_before_clip") or 0,
-                            "train/batch_seconds_so_far": time.monotonic() - started,
+                            "timing/sampling_seconds": sampling_seconds,
+                            "timing/behavior_check_seconds": validation_seconds,
+                            "timing/mini_update_seconds": time.monotonic() - update_started,
+                            "timing/batch_seconds_so_far": time.monotonic() - started,
                         }
                     )
+                memory = [dict(allocated=torch.cuda.max_memory_allocated(), reserved=torch.cuda.max_memory_reserved())]
+                if world > 1:
+                    local_memory = memory[0]
+                    memory = [None] * world
+                    dist.all_gather_object(memory, local_memory)
+                if rank == 0:
+                    metrics["memory/max_allocated_gib"] = max(m["allocated"] for m in memory) / 2**30
+                    metrics["memory/max_reserved_gib"] = max(m["reserved"] for m in memory) / 2**30
                     tracker.log(metrics, step=batch_index * len(minis) + mini_index + 1)
                     save_json(directory / f"mini-{mini_index:02d}/summary.json", dict(metrics=metrics, update=result))
+            completed_now = group_index + tasks_per_batch
+            should_save = checkpoint_due(batch_index + 1, save_freq, final=completed_now == last_group)
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
-            if hasattr(optimizer, "consolidate_state_dict"):
+            save_started = time.monotonic()
+            if should_save and hasattr(optimizer, "consolidate_state_dict"):
                 optimizer.consolidate_state_dict(to=0)
-            states = [rng_state()]
-            if world > 1:
+            states = [rng_state()] if should_save else []
+            if should_save and world > 1:
                 states = [None] * world
                 dist.all_gather_object(states, rng_state())
             saved = None
             if rank == 0:
                 try:
+                    receipt, removed = None, []
+                    if should_save:
+                        receipt = save_boundary(
+                            policy,
+                            optimizer,
+                            args.output / f"checkpoints/group-{completed_now:06d}",
+                            completed_groups=completed_now,
+                            optimizer_steps=updates,
+                            contract=contract,
+                            rng_states=states,
+                        )
+                        save_json(args.output / "latest.json", receipt)
+                        removed = prune_checkpoints(args.output / "checkpoints", receipt, keep)
                     save_json(
                         directory / "summary.json",
                         dict(
@@ -396,19 +451,20 @@ def main():
                             sequences=batch_size,
                             mini_batches=len(minis),
                             optimizer_steps=updates,
+                            completed_sampling_batches=batch_index + 1,
                             seconds=time.monotonic() - started,
+                            checkpoint=receipt,
+                            removed_checkpoints=removed,
                         ),
                     )
-                    receipt = save_boundary(
-                        policy,
-                        optimizer,
-                        args.output / f"checkpoints/group-{group_index + tasks_per_batch:06d}",
-                        completed_groups=group_index + tasks_per_batch,
-                        optimizer_steps=updates,
-                        contract=contract,
-                        rng_states=states,
+                    tracker.log(
+                        {
+                            "timing/batch_seconds": time.monotonic() - started,
+                            "timing/checkpoint_seconds": time.monotonic() - save_started if should_save else 0,
+                            "checkpoint/saved": int(should_save),
+                        },
+                        step=(batch_index + 1) * len(minis),
                     )
-                    save_json(args.output / "latest.json", receipt)
                     saved = dict(ok=True)
                 except Exception:
                     saved = dict(ok=False, error=traceback.format_exc())
@@ -419,7 +475,7 @@ def main():
             save_json(
                 args.output / "progress.json",
                 dict(
-                    phase="complete" if last_group == config["max_groups"] else "stopped_at_group_boundary",
+                    phase="complete" if last_group == max_groups else "stopped_at_group_boundary",
                     completed_groups=last_group,
                     optimizer_steps=updates,
                 ),
