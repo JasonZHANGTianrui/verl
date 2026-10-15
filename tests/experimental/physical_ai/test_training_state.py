@@ -20,11 +20,77 @@ from pathlib import Path
 
 import torch
 
-from verl.experimental.physical_ai.training_state import load_boundary, save_boundary
+from verl.experimental.physical_ai.training_state import (
+    build_optimizer,
+    load_boundary,
+    restore_optimizer,
+    save_boundary,
+)
+
+
+def _zero_adam_worker(rank, directory):
+    """两进程ZeRO-1 AdamW与单进程完整batch逐参数比较，并在两次更新间真实保存/恢复。"""
+    import torch.distributed as dist
+
+    from verl.experimental.physical_ai.distributed import sum_gradients
+
+    directory = Path(directory)
+    dist.init_process_group("gloo", init_method="file://" + str(directory / "rendezvous"), rank=rank, world_size=2)
+    try:
+        torch.manual_seed(9)
+        model = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 1))
+        reference = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 1))
+        reference.load_state_dict(model.state_dict())
+        config = dict(optimizer="adamw", learning_rate=0.01, optimizer_state_sharding=True, weight_decay=0.01)
+        opt = build_optimizer(model, config, distributed=True)
+        ref_opt = torch.optim.AdamW(reference.parameters(), lr=0.01, weight_decay=0.01, foreach=False)
+        x, y = torch.randn(8, 3), torch.randn(8, 1)
+        for step in range(2):
+            opt.zero_grad(set_to_none=True)
+            ref_opt.zero_grad(set_to_none=True)
+            (model(x[rank::2]) - y[rank::2]).square().sum().div(8).backward()
+            sum_gradients(model)
+            (reference(x) - y).square().mean().backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
+            opt.step()
+            ref_opt.step()
+            for actual, expected in zip(model.parameters(), reference.parameters(), strict=False):
+                torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-6)
+            if step == 0:
+                opt.consolidate_state_dict(to=0)
+                if rank == 0:
+                    save_boundary(
+                        model,
+                        opt,
+                        directory / "saved",
+                        completed_groups=8,
+                        optimizer_steps=1,
+                        contract=config,
+                        rng_states=[],
+                    )
+                dist.barrier()
+                state, _ = load_boundary(directory / "saved/checkpoint.json", config)
+                model.load_state_dict(state["model_state_dict"])
+                opt = build_optimizer(model, config, distributed=True)
+                restore_optimizer(opt, state["optimizer_state_dict"])
+                for param, local in opt.optim.state.items():
+                    for key, value in local.items():
+                        if isinstance(value, torch.Tensor) and value.ndim:
+                            assert value.data_ptr() == opt.state[param][key].data_ptr()
+    finally:
+        dist.destroy_process_group()
 
 
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
+
+    def test_zero_adam_matches_reference_after_resume(self):
+        """优化器状态分片/同步及重载不能改变AdamW实际数值更新。"""
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(_zero_adam_worker, args=(directory,), nprocs=2, join=True)
 
     def test_resume_matches_uninterrupted_optimizer(self):
         """连续两步与保存/重载后第二步应逐参数一致，任务/数据变化必须拒绝。"""

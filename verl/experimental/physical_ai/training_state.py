@@ -24,6 +24,33 @@ import torch
 from .online_reward import save_json
 
 
+def build_optimizer(model, config, *, distributed=False):
+    """建立持久优化器；AdamW可用PyTorch ZeRO-1分片状态，模型/梯度仍按原路径同步。
+
+    分片只改变状态存放位置，参数更新仍由torch.optim.AdamW实现；关闭foreach以减少
+    临时张量峰值。保存前所有rank必须consolidate_state_dict，恢复沿官方load_state_dict。
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    if config["optimizer"] == "sgd":
+        return torch.optim.SGD(params, lr=config["learning_rate"])
+    if config["optimizer"] != "adamw":
+        raise ValueError("未支持的优化器")
+    options = dict(
+        lr=config["learning_rate"],
+        betas=tuple(config.get("adam_betas", [0.9, 0.999])),
+        eps=config.get("adam_eps", 1e-8),
+        weight_decay=config.get("weight_decay", 0.0),
+        foreach=False,
+    )
+    if config.get("optimizer_state_sharding", False):
+        if not distributed:
+            raise ValueError("优化器状态分片必须以torchrun多进程启动")
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+
+        return ZeroRedundancyOptimizer(params, optimizer_class=torch.optim.AdamW, **options)
+    return torch.optim.AdamW(params, **options)
+
+
 def content_hash(path):
     """分块核对完整checkpoint内容；只存路径/大小不能保证恢复了原权重。"""
     h = hashlib.sha256()
@@ -31,6 +58,26 @@ def content_hash(path):
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def restore_optimizer(optimizer, state):
+    """沿官方load_state_dict恢复；预先放好ZeRO本rank的状态，避免两层状态视图重复占GPU。
+
+    ZeRO的外层Optimizer与本地AdamW都会处理同一份state。先只将本rank拥有的非标量
+    Tensor搬到目标设备，两次官方加载即可共享相同storage；其他rank状态仍留CPU，
+    由官方ZeRO加载器丢弃。step标量维持CPU。只用公开param_groups对应保存ID，
+    不改AdamW公式，不调用ZeRO的私有分片方法；传入字典与官方接口一样会被修改。
+    """
+    if hasattr(optimizer, "optim"):
+        owned = {id(p) for group in optimizer.optim.param_groups for p in group["params"]}
+        for live, saved in zip(optimizer.param_groups, state["param_groups"], strict=True):
+            for param, identity in zip(live["params"], saved["params"], strict=True):
+                if id(param) in owned and identity in state["state"]:
+                    state["state"][identity] = {
+                        key: value.to(param.device) if isinstance(value, torch.Tensor) and value.ndim else value
+                        for key, value in state["state"][identity].items()
+                    }
+    optimizer.load_state_dict(state)
 
 
 def cpu_tree(value):

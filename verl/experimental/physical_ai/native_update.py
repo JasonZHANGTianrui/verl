@@ -21,8 +21,8 @@ from omegaconf import OmegaConf
 
 from verl.experimental.physical_ai.online_reward import save_json
 
+from .batching import prepare_batch, task_groups
 from .g05_logprobs import next_token_logprobs
-from .seggrpo import segment_advantages, validate_groups
 
 
 def update_once(
@@ -37,6 +37,10 @@ def update_once(
     distributed=False,
     optimizer=None,
     max_grad_norm=None,
+    prepared=None,
+    indices=None,
+    enforce_on_policy=True,
+    clip_ratio=0.2,
 ):
     """收齐组后逐条重算、累积两阶段GRPO梯度，执行一次无动量SGD并记录真实变化。
 
@@ -46,6 +50,9 @@ def update_once(
     不重复除以卡数。所有生成mask来自rollout，父轨迹在QA行仅作前缀；zero-advantage整组明确跳过更新。
     连续训练可传持久optimizer，更新公式保持不变；max_grad_norm在全局归约后统一裁剪。
     不传optimizer仍沿用旧单步SGD诊断，不能将每轮重新创建的有状态优化器冒称恢复。
+    prepared由prepare_batch在采样后、更新前计算；indices选取一个完整mini-batch。
+    多mini-batch路径须先validate_behavior核验同版概率，再用enforce_on_policy=False；
+    此后新旧策略差异属于正常策略更新，不能触发原同版一致性门槛。
     """
     from generate import no_cache_hidden
     from memory import checkpoint_linear_layers
@@ -60,25 +67,25 @@ def update_once(
         if not dist.is_initialized():
             raise RuntimeError("分布式更新要求已初始化进程组")
         rank, world_size = dist.get_rank(), dist.get_world_size()
-    groups = validate_groups(records)
-    if len(groups) != 2 or {r.phase for r in records} != {"execution", "qa"}:
-        raise ValueError("单步诊断要求一个动作组和对应一个QA组")
-    if len(artifacts) != len(records):
-        raise ValueError("输入轨迹与组记录数量不符")
-    length = max(len(a["generated"]) - 1 for a in artifacts)
-    masks = torch.zeros((len(records), length), dtype=torch.bool)
-    old = torch.zeros((len(records), length))
-    for i, item in enumerate(artifacts):
-        masks[i, : len(item["generated"]) - 1] = torch.tensor(item["generated"][1:])
-        old[i, : len(item["old_logprobs"]) - 1] = torch.tensor(item["old_logprobs"][1:])
-    advantages, active, stats = segment_advantages(records, masks)
+    prepared = prepare_batch(records, artifacts) if prepared is None else prepared
+    indices = list(range(len(records))) if indices is None else list(indices)
+    selected_records = [records[i] for i in indices]
+    selected_artifacts = [artifacts[i] for i in indices]
+    pairs = task_groups(selected_records)
+    old, advantages, active = (prepared[k][indices] for k in ("old", "advantages", "active"))
+    phases = {r.group_id for r in selected_records}
+    stats = dict(
+        groups=len(phases),
+        tasks=len(pairs),
+        zero_variance_groups=sum(len({r.reward for r in selected_records if r.group_id == g}) == 1 for g in phases),
+    )
     if not bool(advantages.any()):
         result = dict(status="skipped_zero_advantage", optimizer_step=False, **stats)
         save_json(Path(output) / "update.json", result)
         return result
-    phase_sizes = {phase: sum(r.phase == phase for r in records) for phase in ["execution", "qa"]}
+    phase_sizes = {phase: sum(r.phase == phase for r in selected_records) for phase in ["execution", "qa"]}
     config = OmegaConf.create(
-        dict(clip_ratio=0.2, clip_ratio_low=None, clip_ratio_high=None, clip_ratio_c=3.0, global_batch_info={})
+        dict(clip_ratio=clip_ratio, clip_ratio_low=None, clip_ratio_high=None, clip_ratio_c=3.0, global_batch_info={})
     )
     model.train()
     model.vlm.gradient_checkpointing_enable()
@@ -90,7 +97,7 @@ def update_once(
     torch.cuda.reset_peak_memory_stats()
     rows = []
     with checkpoint_linear_layers(model):
-        for i, (record, artifact) in enumerate(zip(records, artifacts, strict=False)):
+        for i, (record, artifact) in enumerate(zip(selected_records, selected_artifacts, strict=True)):
             if i % world_size != rank or not bool(advantages[i].any()):
                 continue
             inputs = to_device(
@@ -114,9 +121,12 @@ def update_once(
                 )
                 loss = value / phase_sizes[record.phase]
             error = (logprobs.detach() - old[i : i + 1, :n].cuda())[mask].abs()
-            metrics["rollout_actor_max_logprob_error"] = float(error.max())
-            metrics["rollout_actor_mean_logprob_error"] = float(error.mean())
-            if float(error.max()) > max_logprob_error:
+            metrics["behavior_logprob_delta_max"] = float(error.max())
+            metrics["behavior_logprob_delta_mean"] = float(error.mean())
+            if enforce_on_policy:
+                metrics["rollout_actor_max_logprob_error"] = float(error.max())
+                metrics["rollout_actor_mean_logprob_error"] = float(error.mean())
+            if enforce_on_policy and float(error.max()) > max_logprob_error:
                 raise ValueError("同版rollout与actor概率偏差超出诊断阈值，禁止更新")
             loss.backward()
             rows.append(dict(rollout_id=record.rollout_id, phase=record.phase, loss=float(loss.detach()), **metrics))
@@ -138,7 +148,7 @@ def update_once(
                 raise FloatingPointError("非有限梯度，拒绝optimizer.step")
             norm = float(param.grad.float().norm())
             norms.append(norm)
-            if norm > largest_norm:
+            if representative is None or norm > largest_norm:
                 largest_norm = norm
                 representative = (name, param)
     if representative is None:
@@ -173,3 +183,54 @@ def update_once(
     save_json(Path(output) / "update.json", result)
     model.eval()
     return result
+
+
+@torch.no_grad()
+def validate_behavior(model, records, artifacts, prepared, output, *, distributed=False, max_error=0.05):
+    """参数未更新时核验整批真实生成概率，包括零优势组；后续mini-batch不再做此门禁。
+
+    每rank检查自己的行，任何一行不匹配则所有rank拒绝更新。采用与采样一致的
+    FP32完整前缀，保留原old log-prob，不能用重算值替换历史概率掩盖不一致。
+    """
+    from generate import no_cache_hidden
+    from runtime import to_device
+
+    rank, world = 0, 1
+    if distributed:
+        import torch.distributed as dist
+
+        rank, world = dist.get_rank(), dist.get_world_size()
+    model.eval()
+    rows, failure = [], None
+    try:
+        for i, (record, artifact) in enumerate(zip(records, artifacts, strict=True)):
+            if i % world != rank:
+                continue
+            inputs = to_device(
+                torch.load(artifact["inputs_path"], map_location="cpu", weights_only=True), torch.device("cuda")
+            )
+            n = inputs["input_ids"].shape[1] - 1
+            mask = prepared["active"][i : i + 1, :n].cuda()
+            ids_mask = torch.cat((torch.zeros((1, 1), dtype=torch.bool, device="cuda"), mask), 1)
+            hidden = no_cache_hidden(model, inputs)
+            logp = next_token_logprobs(hidden, inputs["input_ids"], ids_mask, model.vlm.decode)
+            error = (logp - prepared["old"][i : i + 1, :n].cuda())[mask].abs()
+            if not len(error) or not bool(torch.isfinite(error).all()) or float(error.max()) > max_error:
+                raise ValueError("更新前行为概率不一致：" + record.rollout_id)
+            rows.append(
+                dict(rollout_id=record.rollout_id, max_error=float(error.max()), mean_error=float(error.mean()))
+            )
+            save_json(Path(output) / f"behavior-rank-{rank}.json", dict(finished=len(rows), rows=rows))
+            del inputs, hidden, logp, mask, error
+    except Exception as error:
+        failure = str(error)
+    reports = [dict(rows=rows, failure=failure)]
+    if distributed:
+        reports = [None] * world
+        dist.all_gather_object(reports, dict(rows=rows, failure=failure))
+    if any(report["failure"] for report in reports):
+        raise ValueError("整批拒绝更新：" + str([r["failure"] for r in reports if r["failure"]]))
+    rows = [row for report in reports for row in report["rows"]]
+    if len(rows) != len(records):
+        raise ValueError("行为概率核对行数不完整")
+    return dict(checked=len(rows), max_error=max(row["max_error"] for row in rows))

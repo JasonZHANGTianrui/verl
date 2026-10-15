@@ -91,8 +91,8 @@ API错误或未知GT阻止整组更新；全同分组优势为0，不重采制�
 ## 连续训练与SwanLab
 
 `train`复用`pilot.collect_group`和`native_update.update_once`，没有另一份模型生成或
-奖励实现。当前profile使用FP32、持久SGD、归约后全局梯度裁剪；采集在rank0串行完成，
-所有rank按响应分片重算策略梯度。它是fork中的原生PyTorch分布式接入，不是Ray/FSDP
+奖励实现。旧stage1使用FP32、持久SGD、rank0采集；新batch配置可按任务跨rank并行
+采集，完整收齐后再切mini-batch，所有rank按响应分片重算策略梯度。它是fork中的原生PyTorch分布式接入，不是Ray/FSDP
 或vLLM后端，采样吞吐尚未优化。第一阶段仅启用已绑定设备状态奖励的训练任务。
 
 ```bash
@@ -113,6 +113,30 @@ SwanLab走verl原生`Tracking`；密钥只从私有文件进入进程环境，�
 只上报动作/QA奖励、有效更新数、零方差组、概率误差、梯度范数和耗时，不上传私有
 轨迹或GT。`swanlab.json`给出云端入口，`progress.json`与逐group日志保留本地进度。
 此profile未加reference KL；全部同分的组仍为零优势，不能据此重采制造奖励差异。
+
+### Batch 128、mini-batch 32、两阶段n=8
+
+配置为`configs/sft-task-b128-m32-n8.json`。每个采样batch包含8个任务，每任务8条
+动作轨迹，加上从中均匀选一父经历后的8条QA；共128条阶段序列。每个mini-batch
+包含2个完整任务，共32条序列。两卡各以micro-batch 1累积最多16次反向，每批1个
+PPO epoch，最多4次更新。初次启动max_groups=16，即2个采样batch、最多8次更新；
+这里groups计任务记录，不能把它误解成16个128序列的batch。
+
+`batching.py`在更新前一次性固定各任务/阶段的优势和原始old log-prob，并给响应
+身份加任务前缀。全部同版行为概率先核对，包括零优势组；后续mini-batch产生的
+策略差异正常进入PPO loss，不再套用同版概率误差门槛，也不能重标old log-prob。
+
+新配置用AdamW lr=1e-6、betas=(0.9,0.999)、eps=1e-8、weight_decay=0，梯度裁剪1。
+使用PyTorch ZeroRedundancyOptimizer分片AdamW状态（ZeRO-1），模型与梯度仍复制，
+不冒称FSDP/ZeRO-3。更新前沿原全局梯度归约；保存前清梯度并由全部rank合并优化器
+状态到rank0，随后保存原生完整权重/优化器/游标/RNG。单卡分片配置明确拒绝。
+
+两个rank分别采完整任务，同一任务的环境/动作/QA仍在同一进程串行，EGL按本rank
+GPU绑定。任何任务失败于资源、GT或接口时拒绝整个采样batch，不缩组。保存/停止
+必须在完整采样batch边界：此配置`--stop-after-groups 8`跑完首批，再从
+`checkpoints/group-000008/checkpoint.json`在新目录恢复余下8个任务。
+
+仍只接入配置指定的已验证任务奖励，模板、相机、稳定等待和完整会话不因batch改变。
 
 ## 检查
 

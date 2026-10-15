@@ -20,6 +20,7 @@ from dataclasses import replace
 import torch
 from omegaconf import OmegaConf
 
+from verl.experimental.physical_ai.batching import minibatch_indices, namespace_group, prepare_batch
 from verl.experimental.physical_ai.seggrpo import Segment, segment_advantages, segmented_policy_loss, select_parent
 
 
@@ -52,6 +53,52 @@ def fixture():
 
 class SegGRPOTests(unittest.TestCase):
     """针对分组、反向和选择偏置测试，而不是只验证字段名字。"""
+
+    def test_complete_task_minibatches_and_frozen_advantages(self):
+        """128条按8＋8完整任务切成四个32条mini；缺QA、拆任务和混策略均拒绝。"""
+        records, artifacts = [], []
+        for task in range(8):
+            rows = [
+                Segment(f"a{i}", "execution", "a", "initial", f"c{task}", "v1", 8, 0, 4, i % 2, "scored")
+                for i in range(8)
+            ]
+            rows += [
+                Segment(
+                    f"q{i}", "qa", "q", "prefix", f"c{task}", "v1", 8, 4, 8, i % 2, "scored", parent_rollout_id="a0"
+                )
+                for i in range(8)
+            ]
+            records.extend(namespace_group(rows, f"task{task}"))
+            artifacts.extend([dict(generated=[False] + [True] * 8, old_logprobs=[0.0] + [-1.0] * 8) for _ in rows])
+        batch = prepare_batch(records, artifacts)
+        old = batch["old"].clone()
+        minis = minibatch_indices(records, 32)
+        self.assertEqual([len(m) for m in minis], [32] * 4)
+        for indices in minis:
+            sub = [records[i] for i in indices]
+            self.assertEqual(len({r.case_id for r in sub}), 2)
+            adv, mask, _ = segment_advantages(sub, torch.ones((32, 8), dtype=torch.bool))
+            torch.testing.assert_close(adv, batch["advantages"][indices])
+            self.assertFalse(bool(mask[[i for i, r in enumerate(sub) if r.phase == "qa"], :4].any()))
+        with self.assertRaises(ValueError):
+            minibatch_indices(records, 24)
+        with self.assertRaises(ValueError):
+            minibatch_indices(records[:-8], 32)
+        with self.assertRaises(ValueError):
+            prepare_batch([replace(records[0], policy_version="v2")] + records[1:], artifacts)
+        # 模拟后续mini的策略已明显改变；old不变，clip应消除越界方向的策略梯度。
+        indices = minis[1]
+        new = (old[indices] + 0.5 * batch["advantages"][indices].sign()).requires_grad_()
+        cfg = OmegaConf.create(
+            dict(clip_ratio=0.2, clip_ratio_low=None, clip_ratio_high=None, clip_ratio_c=3.0, global_batch_info={})
+        )
+        loss, metrics = segmented_policy_loss(
+            [records[i] for i in indices], old[indices], new, torch.ones((32, 8), dtype=torch.bool), actor_config=cfg
+        )
+        loss.backward()
+        self.assertTrue(torch.equal(new.grad, torch.zeros_like(new)))
+        self.assertTrue(any(v > 0 for k, v in metrics.items() if "pg_clipfrac" in k and "lower" not in k))
+        torch.testing.assert_close(batch["old"], old)
 
     def test_stage_advantages_and_prefix_gradient(self):
         """QA答对可获正优势，即使父动作失败；复制前缀没有第二次策略梯度。"""

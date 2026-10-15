@@ -60,7 +60,7 @@ def restore_rng(state):
 def main():
     """每组重新采样→真实在线奖励→全局优势/分片梯度→组边界保存，支持torchrun。
 
-    采样目前在rank0串行进行，其他rank参加梯度计算与全局归约；没有冒称vLLM、
+    采样可按完整任务分给各rank并行执行，收齐整个batch后全局核验/分片更新；没有冒称vLLM、
     Ray/FSDP已接入。模型数据路径与pilot完全共用，不维护第二套G0.5推理器。
     错误阻止全组更新；恢复只从完整checkpoint开始，旧的半组保留在旧attempt目录。
     """
@@ -81,18 +81,30 @@ def main():
     import torch.distributed as dist
     from runtime import load_policy
 
-    from .native_update import update_once
+    from .batching import minibatch_indices, namespace_group, prepare_batch
+    from .native_update import update_once, validate_behavior
     from .online_reward import save_json
     from .pilot import collect_group
     from .precision import stable_delta_precision
     from .task_data import load_task_release
-    from .training_state import content_hash, load_boundary, make_tracker, save_boundary
+    from .training_state import (
+        build_optimizer,
+        content_hash,
+        load_boundary,
+        make_tracker,
+        restore_optimizer,
+        save_boundary,
+    )
 
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(local_rank)
+    runtime_config = json.loads(args.config.read_text())
     if world > 1:
-        dist.init_process_group("nccl", timeout=timedelta(hours=3))
+        dist.init_process_group(
+            "nccl", timeout=timedelta(minutes=runtime_config.get("collective_timeout_minutes", 180))
+        )
 
     def broadcast(value):
         """rank0的采集/保存状态显式广播；异常不能让其他rank误进入下一次更新。"""
@@ -103,21 +115,37 @@ def main():
 
     tracker = None
     try:
-        config = json.loads(args.config.read_text())
+        config = runtime_config
         if config["sampling_mode"] != "recompute" or config["compute_dtype"] != "float32":
             raise ValueError("此后端仅启用已通过完整轨迹概率验收的FP32重算")
-        if config["optimizer"] != "sgd" or config["max_groups"] < 1:
-            raise ValueError("当前首阶段使用显式SGD；其他优化器需另行验证显存和恢复")
+        if config["optimizer"] not in {"sgd", "adamw"} or config["max_groups"] < 1:
+            raise ValueError("需要合法优化器及正数任务组预算")
         if min(config["execution_group_size"], config["qa_group_size"]) < 2:
             raise ValueError("GRPO两组均须至少两条")
+        width = config["execution_group_size"] + config["qa_group_size"]
+        batch_size = config.get("batch_size", width)
+        mini_size = config.get("mini_batch_size", batch_size)
+        tasks_per_batch = batch_size // width
+        if (
+            batch_size % width
+            or mini_size % width
+            or batch_size % mini_size
+            or tasks_per_batch < 1
+            or config["max_groups"] % tasks_per_batch
+            or config.get("micro_batch_size_per_gpu", 1) != 1
+            or config.get("ppo_epochs", 1) != 1
+        ):
+            raise ValueError("batch/mini-batch须由完整任务组组成；当前micro-batch及PPO epochs固定1")
+        if args.stop_after_groups and args.stop_after_groups % tasks_per_batch:
+            raise ValueError("停止点必须在完整采样batch边界")
         random.seed(config["seed"] + rank)
         np.random.seed(config["seed"] + rank)
         torch.manual_seed(config["seed"] + rank)
         source = args.task_release / "train.jsonl"
         rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
         eligible = [r for r in rows if r["environment"]["task_name"] == config["task_rule"]["task_name"]]
-        if not eligible:
-            raise ValueError("没有绑定已验证动作奖励的任务")
+        if len(eligible) < tasks_per_batch:
+            raise ValueError("已绑定动作奖励的训练记录不足一个batch")
         # 固定训练任务顺序只由身份与seed决定，与奖励、QA答案及SFT成败无关。
         eligible.sort(key=lambda t: hashlib.sha256(f"{config['seed']}:{t['id']}".encode()).hexdigest())
         _, resources = load_task_release(args.task_release, eligible[0]["id"])
@@ -181,11 +209,9 @@ def main():
             args.bundle, checkpoint, torch.device("cuda", local_rank), "torch", args.bundle / "hf_processor", "sdpa"
         )
         stable_delta_precision(policy.model)
-        optimizer = torch.optim.SGD(
-            [p for p in policy.model.parameters() if p.requires_grad], lr=config["learning_rate"]
-        )
+        optimizer = build_optimizer(policy.model, config, distributed=world > 1)
         if restored:
-            optimizer.load_state_dict(restored["optimizer_state_dict"])
+            restore_optimizer(optimizer, restored["optimizer_state_dict"])
             restore_rng(restored["rng_states"][rank])
             del restored
         last_group = (
@@ -193,71 +219,168 @@ def main():
             if args.stop_after_groups
             else config["max_groups"]
         )
-        for group_index in range(completed, last_group):
+        if completed % tasks_per_batch:
+            raise ValueError("恢复点不是完整采样batch边界")
+        for group_index in range(completed, last_group, tasks_per_batch):
             started = time.monotonic()
-            task = eligible[group_index % len(eligible)]
-            run_config = deepcopy(config)
-            run_config.update(
-                case_id=task["id"],
-                suite=task["environment"]["suite"],
-                task_name=task["environment"]["task_name"],
-                question=task["followup"]["question_spec"],
-                entity_names=task["followup"]["entity_names"],
-                seed=config["seed"] + group_index * 1000,
-            )
-            directory = args.output / f"group-{group_index:06d}"
+            batch_index = group_index // tasks_per_batch
+            directory = args.output / f"batch-{batch_index:06d}"
+            if rank == 0:
+                directory.mkdir()
+                save_json(
+                    args.output / "progress.json",
+                    dict(
+                        phase="sampling",
+                        batch=batch_index,
+                        completed_groups=group_index,
+                        tasks_per_batch=tasks_per_batch,
+                        planned_groups=config["max_groups"],
+                        optimizer_steps=updates,
+                    ),
+                )
+            broadcast(True if rank == 0 else None)
             optimizer.zero_grad(set_to_none=True)
             gc.collect()
             torch.cuda.empty_cache()
-            collected = None
-            if rank == 0:
-                try:
-                    directory.mkdir()
+            policy.model.eval()
+            local_tasks, failure = [], None
+            try:
+                for offset in range(tasks_per_batch):
+                    owner = offset % world if config.get("parallel_rollouts", False) else 0
+                    if owner != rank:
+                        continue
+                    task_index = group_index + offset
+                    task = eligible[task_index % len(eligible)]
+                    run_config = deepcopy(config)
+                    run_config.update(
+                        case_id=task["id"],
+                        suite=task["environment"]["suite"],
+                        task_name=task["environment"]["task_name"],
+                        question=task["followup"]["question_spec"],
+                        entity_names=task["followup"]["entity_names"],
+                        seed=config["seed"] + task_index * 1000,
+                    )
+                    task_dir = directory / f"task-{task_index:06d}"
+                    task_dir.mkdir()
+                    save_json(task_dir / "task.json", task)
                     save_json(
-                        args.output / "progress.json",
+                        args.output / f"progress-rank-{rank}.json",
                         dict(
-                            phase="sampling",
-                            group=group_index,
-                            planned_groups=config["max_groups"],
-                            task_id=task["id"],
-                            optimizer_steps=updates,
+                            phase="sampling", batch=batch_index, task_index=task_index, finished_tasks=len(local_tasks)
                         ),
                     )
-                    save_json(directory / "task.json", task)
-                    records, artifacts = collect_group(
+                    task_records, task_artifacts = collect_group(
                         policy,
                         processor,
                         run_config,
-                        directory,
+                        task_dir,
                         policy_version=f"{contract['source_checkpoint_sha256']}/update-{updates}",
                         task=task,
                         resources=resources,
                     )
-                    collected = dict(ok=True, records=records, artifacts=artifacts)
-                except Exception:
-                    collected = dict(ok=False, error=traceback.format_exc())
-            collected = broadcast(collected)
-            if not collected["ok"]:
-                raise RuntimeError(collected["error"])
-            records, artifacts = collected["records"], collected["artifacts"]
-            rank_dir = directory / f"rank-{rank}"
-            rank_dir.mkdir()
+                    local_tasks.append(
+                        dict(
+                            index=task_index,
+                            records=namespace_group(task_records, f"task-{task_index:06d}"),
+                            artifacts=task_artifacts,
+                        )
+                    )
+            except Exception:
+                failure = traceback.format_exc()
+            reports = [dict(tasks=local_tasks, failure=failure)]
+            if world > 1:
+                reports = [None] * world
+                dist.all_gather_object(reports, dict(tasks=local_tasks, failure=failure))
+            if any(r["failure"] for r in reports):
+                raise RuntimeError("采样batch不完整，禁止更新：" + str([r["failure"] for r in reports if r["failure"]]))
+            collected = sorted([t for r in reports for t in r["tasks"]], key=lambda t: t["index"])
+            if len(collected) != tasks_per_batch:
+                raise ValueError("采样任务数不完整")
+            records = [r for t in collected for r in t["records"]]
+            artifacts = [a for t in collected for a in t["artifacts"]]
+            if len(records) != batch_size:
+                raise ValueError("实际序列数不等于配置batch_size")
+            prepared = prepare_batch(records, artifacts)
+            minis = minibatch_indices(records, mini_size)
             if rank == 0:
+                from dataclasses import asdict
+
+                save_json(directory / "groups.json", [asdict(r) for r in records])
                 save_json(
-                    args.output / "progress.json", dict(phase="update", group=group_index, optimizer_steps=updates)
+                    args.output / "progress.json",
+                    dict(
+                        phase="validate_behavior",
+                        batch=batch_index,
+                        completed_groups=group_index,
+                        optimizer_steps=updates,
+                    ),
                 )
-            result = update_once(
+            parity = validate_behavior(
                 policy.model,
                 records,
                 artifacts,
-                rank_dir,
-                compute_dtype="float32",
+                prepared,
+                directory,
                 distributed=world > 1,
-                optimizer=optimizer,
-                learning_rate=config["learning_rate"],
-                max_grad_norm=config["max_grad_norm"],
+                max_error=config.get("behavior_logprob_tolerance", 0.05),
             )
-            updates += int(result["optimizer_step"])
+            for mini_index, indices in enumerate(minis):
+                rank_dir = directory / f"mini-{mini_index:02d}" / f"rank-{rank}"
+                rank_dir.mkdir(parents=True)
+                if rank == 0:
+                    save_json(
+                        args.output / "progress.json",
+                        dict(
+                            phase="update",
+                            batch=batch_index,
+                            mini_batch=mini_index,
+                            mini_batches=len(minis),
+                            optimizer_steps=updates,
+                        ),
+                    )
+                result = update_once(
+                    policy.model,
+                    records,
+                    artifacts,
+                    rank_dir,
+                    compute_dtype="float32",
+                    distributed=world > 1,
+                    optimizer=optimizer,
+                    learning_rate=config["learning_rate"],
+                    max_grad_norm=config["max_grad_norm"],
+                    prepared=prepared,
+                    indices=indices,
+                    enforce_on_policy=False,
+                    clip_ratio=config.get("clip_ratio", 0.2),
+                )
+                updates += int(result["optimizer_step"])
+                if rank == 0:
+                    metrics = {
+                        f"reward/{phase}": sum(records[i].reward for i in indices if records[i].phase == phase)
+                        / sum(records[i].phase == phase for i in indices)
+                        for phase in ("execution", "qa")
+                    }
+                    rows_metrics = result.get("rows", [])
+                    metrics.update(
+                        {
+                            "train/optimizer_steps": updates,
+                            "train/zero_variance_groups": result["zero_variance_groups"],
+                            "train/behavior_check_max_error": parity["max_error"],
+                            "train/behavior_logprob_delta_max": max(
+                                (r["behavior_logprob_delta_max"] for r in rows_metrics), default=0
+                            ),
+                            "train/clip_fraction": sum(r.get("actor/pg_clipfrac", 0) for r in rows_metrics)
+                            / max(1, len(rows_metrics)),
+                            "train/grad_norm": result.get("grad_norm_before_clip") or 0,
+                            "train/batch_seconds_so_far": time.monotonic() - started,
+                        }
+                    )
+                    tracker.log(metrics, step=batch_index * len(minis) + mini_index + 1)
+                    save_json(directory / f"mini-{mini_index:02d}/summary.json", dict(metrics=metrics, update=result))
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            if hasattr(optimizer, "consolidate_state_dict"):
+                optimizer.consolidate_state_dict(to=0)
             states = [rng_state()]
             if world > 1:
                 states = [None] * world
@@ -265,29 +388,22 @@ def main():
             saved = None
             if rank == 0:
                 try:
-                    metrics = {
-                        f"reward/{phase}": sum(r.reward for r in records if r.phase == phase)
-                        / sum(r.phase == phase for r in records)
-                        for phase in ("execution", "qa")
-                    }
-                    metrics.update(
-                        {
-                            "train/optimizer_steps": updates,
-                            "train/zero_variance_groups": result["zero_variance_groups"],
-                            "train/group_seconds": time.monotonic() - started,
-                            "train/max_logprob_error": max(
-                                (r["rollout_actor_max_logprob_error"] for r in result.get("rows", [])), default=0
-                            ),
-                            "train/grad_norm": result.get("grad_norm_before_clip") or 0,
-                        }
+                    save_json(
+                        directory / "summary.json",
+                        dict(
+                            behavior_check=parity,
+                            tasks=tasks_per_batch,
+                            sequences=batch_size,
+                            mini_batches=len(minis),
+                            optimizer_steps=updates,
+                            seconds=time.monotonic() - started,
+                        ),
                     )
-                    tracker.log(metrics, step=group_index + 1)
-                    save_json(directory / "summary.json", dict(metrics=metrics, update=result))
                     receipt = save_boundary(
                         policy,
                         optimizer,
-                        args.output / f"checkpoints/group-{group_index + 1:06d}",
-                        completed_groups=group_index + 1,
+                        args.output / f"checkpoints/group-{group_index + tasks_per_batch:06d}",
+                        completed_groups=group_index + tasks_per_batch,
                         optimizer_steps=updates,
                         contract=contract,
                         rng_states=states,
