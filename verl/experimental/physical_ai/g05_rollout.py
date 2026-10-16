@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from benchmark.adapters.libero_execution import hold_control_targets
 
 from verl.experimental.physical_ai.online_reward import public_text, save_json
 
@@ -69,7 +70,6 @@ def phase_steps(
         single_action_to_libero_action,
     )
     from inference import CachedSession
-    from rollout.g05.chat_libero import hold_last_goal
     from rollout.g05.tool_runtime import (
         ActionDecodeError,
         append_feedback,
@@ -192,7 +192,7 @@ def phase_steps(
                 env_steps - (session.steps - before_steps),
                 decode,
                 step,
-                hold=lambda: hold_last_goal(session.env),
+                hold=lambda: hold_control_targets(session.env),
             )
             save_json(directory / f"execution-{len(traces):03d}.json", execution)
             raw, _ = build_libero_raw_obs(session.observation, session.task)

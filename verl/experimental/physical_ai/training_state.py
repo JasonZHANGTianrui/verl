@@ -233,16 +233,31 @@ def validate_resume_contract(source, target, migration=None):
     """默认要求完全相同；显式迁移只允许卡数及已确认代码指纹发生变化。
 
     migration必须精确绑定来源与目标契约SHA。数据、算法配置、原始权重、处理器
-    等其他字段始终严格相同，不能把迁移当作跳过校验的开关。
+    等其他字段始终严格相同，不能把迁移当作跳过校验的开关。显式online_execution_rebind
+    仅接由原任务逐字段核验的新在线条件；任务ID/算法/源权重必须保持。
     """
     if source == target and migration is None:
         return
-    if migration is None or migration != {
+    expected = {
         "source_contract_sha256": contract_hash(source),
         "target_contract_sha256": contract_hash(target),
-    }:
+    }
+    rebind = migration is not None and migration.get("online_execution_rebind") is True
+    if rebind:
+        expected["online_execution_rebind"] = True
+    if migration != expected:
         raise ValueError("恢复配置/数据或显式迁移批准不一致")
     excluded = {"world_size", "implementation_files"}
+    if rebind:
+        # train启动时已读取原任务表并逐字段核对只新增online_execution；此处绑定来源。
+        proof = target.get("task_rebind", {})
+        if (
+            proof.get("source_tasks_sha256") != source["tasks_sha256"]
+            or proof.get("target_tasks_sha256") != target["tasks_sha256"]
+            or not proof.get("preserved_tasks_sha256")
+        ):
+            raise ValueError("缺少原问题/初态不变的在线执行重绑定凭据")
+        excluded.update({"tasks_sha256", "task_rebind"})
     if {k: v for k, v in source.items() if k not in excluded} != {k: v for k, v in target.items() if k not in excluded}:
         raise ValueError("迁移不能改变训练配置/数据/权重")
     if any(type(c.get("world_size")) is not int or c["world_size"] < 1 for c in (source, target)):

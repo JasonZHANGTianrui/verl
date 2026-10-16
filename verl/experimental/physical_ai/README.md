@@ -216,3 +216,17 @@ phase_steps是单条与批量路径共用的动作/工具/观察实现；run_pha
 整批训练提速。先过真实采样、整批概率核对和梯度更新，再报告实际吞吐。
 
 在线QA裁判默认最多20次请求（含首次），失败间隔5/10/20/40秒后封顶60秒；重试同一问题、GT和回答，日志记录当前重试次数。有效0分或needs_review不继续请求；耗尽仍保留null并拒绝更新，不能把API故障记为能力失败。
+
+### 公共执行接口迁移
+
+训练示范初态直接复用`ours.sft.sources.libero_source.open_environment(seed=...)`，
+统一v5准备返回首观察；不在之后重复刷新控制器。普通初始化仍从make_env进入。
+两处在线保持均调用`benchmark.adapters.libero_execution.hold_control_targets`，
+保持手臂及夹爪末目标、正常物理积分。每个任务保存preparation及在线执行身份。
+
+旧任务包不能直接套新版环境。用`ours.rl.prepare_online`实际准备新任务包，
+保留旧来源字段并追加online_execution；运行时核对其实现/关系身份和完整准备状态。
+恢复时若批准文件显式设置`online_execution_rebind: true`，启动器先逐字段确认
+新旧任务只有online_execution差异，再允许任务文件hash变化。算法、权重、任务ID
+及顺序保持原值。这是新执行条件下的训练分支，不能冒充旧环境逐位续跑。
+Mem仍未作为训练任务接入；公共监测器和clone支持不等于其奖励/会话已经验收。

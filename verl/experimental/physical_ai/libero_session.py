@@ -116,32 +116,22 @@ class LiberoSession:
         self.broken = False
         self.action_history = []
         try:
-            self.env, task, states = make_env(
-                suite,
-                task_index,
-                resolution,
-                physics_patch=physics_patch,
-            )
-            self.task = task.language
-            self.env.seed(seed)
-            self.env.reset()
-            if initial_condition is None:
+            if initial_condition is not None:
+                from ours.sft.sources.libero_source import open_environment
+
+                if physics_patch is not None:
+                    raise ValueError("训练示范初态不能叠加未声明物理补丁")
+                self.env, task, _, self.observation = open_environment(initial_condition, suite, resolution, seed=seed)
+            else:
+                self.env, task, states = make_env(suite, task_index, resolution, physics_patch=physics_patch)
+                self.env.seed(seed)
+                self.env.reset()
                 if initial_state_index >= len(states):
                     raise IndexError("初始状态索引越界")
                 self.observation = self.env.set_init_state(states[initial_state_index])
-            else:
-                from benchmark.adapters.libero_env import LIBERO_PKG
-                from ours.sft.sources.libero_source import (
-                    localize_xml,
-                    synchronize_controller_observation,
-                )
-
-                if physics_patch is not None or initial_condition.task_name != task.name:
-                    raise ValueError("训练初态须匹配原任务，不能同时叠加未声明物理补丁")
-                self.env.reset_from_xml_string(localize_xml(initial_condition.model_xml, LIBERO_PKG / "assets"))
-                self.env.env.sim.reset()
-                self.observation = self.env.set_init_state(initial_condition.simulator_states[0])
-                synchronize_controller_observation(self.env)
+            self.task = task.language
+            # 统一set_init_state已经刷新控制器和首观察，回执即本次任务第0步。
+            self.preparation = deepcopy(self.env.preparation)
             bind_render_context(self.env.env.sim)
             self.last_action = np.array([0.0] * 6 + [-1.0])
         except BaseException:
@@ -169,7 +159,7 @@ class LiberoSession:
 
         actions形状[T,7]：前三维平移、后三维旋转均为LIBERO OSC归一化增量，最后一维
         夹爪指令-1开/+1闭；不是米/弧度的绝对位姿。输入先完整校验，非法控制不执行。
-        observe_steps为0–100个20Hz保持步，调用既有hold_last_goal；它与控制共用预算。
+        observe_steps为0–100个20Hz保持步，调用公共hold_control_targets；它与控制共用预算。
         预算截断不伪称全部完成，原生success只供审计，不提前终止或自动补动作。
         """
         self._check_owner()
@@ -183,7 +173,7 @@ class LiberoSession:
             raise ValueError("动作越出环境控制范围，不静默裁剪")
         if type(observe_steps) is not int or not 0 <= observe_steps <= 100:
             raise ValueError("observe_steps必须为0至100的整数")
-        from rollout.g05.chat_libero import hold_last_goal
+        from benchmark.adapters.libero_execution import hold_control_targets
         from rollout.g05.tool_runtime import execute_segments
 
         request = dict(
@@ -214,7 +204,7 @@ class LiberoSession:
                 self.max_steps - self.steps,
                 decode,
                 step,
-                hold=lambda: hold_last_goal(self.env),
+                hold=lambda: hold_control_targets(self.env),
             )
         except BaseException:
             self.broken = True
@@ -241,6 +231,7 @@ class LiberoSession:
             if self.env.env.sim.model.get_xml() != child.env.env.sim.model.get_xml():
                 raise ValueError("环境模型XML不同，拒绝套用物理缓存")
             clone_runtime(self.env, child.env)
+            child.preparation = deepcopy(self.preparation)
             child.steps = self.steps
             child.last_action = self.last_action.copy()
             child.action_history = deepcopy(self.action_history)

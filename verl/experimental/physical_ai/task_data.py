@@ -91,9 +91,31 @@ def open_task_session(task, resources, *, seed, max_steps, resolution=256):
         resolution=resolution,
         initial_condition=initial,
     )
-    if session.env.scene_initialization["version"] != task["environment"]["initialization_version"]:
+    expected = task.get("online_execution", {}).get(
+        "initialization_version", task["environment"]["initialization_version"]
+    )
+    if session.env.scene_initialization["version"] != expected:
         session.close()
         raise ValueError("RL与来源的场景初始化规则不一致")
+    online = task.get("online_execution")
+    if online:
+        from benchmark.adapters.libero_execution import assert_same_preparation, implementation_identity
+        from benchmark.libero.qa_relations import VERSION as relation_version
+        from ours.rl.prepare_online import semantic_identity
+
+        if (
+            online["implementation"] != implementation_identity()
+            or online["relation_view"] != relation_version
+            or online["semantics"] != semantic_identity()
+        ):
+            session.close()
+            raise ValueError("在线执行/关系实现与新任务发布不一致")
+        expected_preparation = json.loads(resolve_resource(online["preparation_ref"], resources).read_text())
+        try:
+            assert_same_preparation(expected_preparation, session.preparation)
+        except Exception:
+            session.close()
+            raise
     return session
 
 
@@ -109,7 +131,10 @@ def create_scene_capture(session, task, resources, output, *, rollout_id):
 
     if not isinstance(rollout_id, str) or not rollout_id:
         raise ValueError("需要真实rollout身份")
-    expected = json.loads(resolve_resource(task["environment"]["scene_config_ref"], resources).read_text())
+    online = task.get("online_execution", {})
+    expected = json.loads(
+        resolve_resource(online.get("scene_config_ref", task["environment"]["scene_config_ref"]), resources).read_text()
+    )
     initial = session.settings["initial_condition"]
     capture = SceneCapture(
         session.env,
@@ -127,6 +152,14 @@ def create_scene_capture(session, task, resources, output, *, rollout_id):
     ]:
         if current.get(key) != expected.get(key):
             raise ValueError("在线Scene map配置与复用题目不一致：" + key)
+    from benchmark.adapters.libero_execution import assert_same_state, runtime_state
+
+    from .online_reward import save_json
+
+    # 图采集初始化是只读行为；必须与统一准备完成后的状态一致，不另推进物理。
+    assert_same_state(session.preparation["state"], runtime_state(session.env))
+    save_json(Path(output) / "preparation.json", session.preparation)
+    save_json(Path(output) / "online-execution.json", online)
     capture.eid = rollout_id
     capture.case["case_id"] = rollout_id
     capture.recorder = SceneRecorder(rollout_id, max_gap_s=capture.reader.config["max_sample_gap_s"])

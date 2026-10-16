@@ -193,6 +193,11 @@ def main():
             ),
             implementation_files={p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
         )
+        from ours.rl.prepare_online import validate_rebind
+
+        task_rebind = validate_rebind(args.task_release, rows)
+        if task_rebind:
+            contract["task_rebind"] = task_rebind
         checkpoint, completed, updates, restored = args.checkpoint, 0, 0, None
         if args.resume:
             restored, receipt = load_boundary(

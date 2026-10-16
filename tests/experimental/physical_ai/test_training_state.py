@@ -166,6 +166,26 @@ class TrainingStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_resume_contract(source, bad, approval)
 
+    def test_execution_rebind_requires_explicit_unchanged_task_proof(self):
+        """新在线物理条件需独立批准；仅改task hash或更改算法均不能偷渡恢复。"""
+        source = dict(config={"batch_size": 128}, world_size=8, tasks_sha256="source", eligible_ids=["a"])
+        target = dict(
+            source,
+            tasks_sha256="target",
+            task_rebind=dict(
+                source_tasks_sha256="source", target_tasks_sha256="target", preserved_tasks_sha256="same-tasks"
+            ),
+        )
+        approval = dict(source_contract_sha256=contract_hash(source), target_contract_sha256=contract_hash(target))
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, target, approval)
+        approval["online_execution_rebind"] = True
+        validate_resume_contract(source, target, approval)
+        target["eligible_ids"] = ["other"]
+        approval["target_contract_sha256"] = contract_hash(target)
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, target, approval)
+
     def test_batch_budget_and_safe_retention(self):
         """100批按10批保存；新写入失败不能删旧恢复点，keep=1不碰其他实验/未完成文件。"""
         self.assertEqual(training_budget(dict(total_training_steps=100), 8), 800)
