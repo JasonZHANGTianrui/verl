@@ -68,9 +68,12 @@ def main():
     for name in ("bundle", "checkpoint", "task-release", "config", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--resume", type=Path, help="上一完整组checkpoint.json；必须使用新output目录")
+    parser.add_argument("--resume-migration", type=Path, help="显式来源/目标契约SHA批准；仅允许拓扑及已审核代码迁移")
     parser.add_argument("--swanlab-key-file", type=Path)
     parser.add_argument("--stop-after-groups", type=int, help="本次仅运行若干完整组，用于真实保存/恢复验收")
     args = parser.parse_args()
+    if args.resume_migration and not args.resume:
+        parser.error("resume-migration需要resume")
     if args.stop_after_groups is not None and args.stop_after_groups < 1:
         parser.error("stop-after-groups必须为正整数")
     for key, value in vars(args).items():
@@ -87,7 +90,7 @@ def main():
     from .pilot import collect_group
     from .precision import stable_delta_precision
     from .task_data import load_task_release
-    from .training_metrics import rollout_metrics, update_metrics
+    from .training_metrics import rollout_metrics, sampling_batch_metrics, update_metrics
     from .training_state import (
         build_optimizer,
         checkpoint_due,
@@ -192,7 +195,11 @@ def main():
         )
         checkpoint, completed, updates, restored = args.checkpoint, 0, 0, None
         if args.resume:
-            restored, receipt = load_boundary(args.resume, contract)
+            restored, receipt = load_boundary(
+                args.resume,
+                contract,
+                migration=json.loads(args.resume_migration.read_text()) if args.resume_migration else None,
+            )
             checkpoint = Path(receipt["path"])
             completed, updates = restored["completed_groups"], restored["optimizer_steps"]
         startup = None
@@ -209,6 +216,7 @@ def main():
                         backend="native_g05_torch_distributed",
                         ray_fsdp=False,
                         resume=str(args.resume),
+                        migration=json.loads(args.resume_migration.read_text()) if args.resume_migration else None,
                     ),
                 )
                 tracker_config = dict(config, **{k: v for k, v in algorithm.items() if k not in config})
@@ -260,7 +268,15 @@ def main():
         optimizer = build_optimizer(policy.model, config, distributed=world > 1)
         if restored:
             restore_optimizer(optimizer, restored["optimizer_state_dict"])
-            restore_rng(restored["rng_states"][rank])
+            if restored["contract"]["world_size"] == world:
+                restore_rng(restored["rng_states"][rank])
+            else:
+                # 改卡数后不存在一一对应的rank随机流，按恢复游标和新rank确定性重建。
+                # 模型/AdamW/训练游标完整恢复，但不声称与旧拓扑逐位相同。
+                resume_seed = config["seed"] + completed * 1000 + rank
+                random.seed(resume_seed)
+                np.random.seed(resume_seed % 2**32)
+                torch.manual_seed(resume_seed)
             del restored
         last_group = min(max_groups, completed + args.stop_after_groups) if args.stop_after_groups else max_groups
         if completed % tasks_per_batch:
@@ -367,6 +383,7 @@ def main():
                 control_group=control_group,
             )
             validation_seconds = time.monotonic() - validation_started
+            mini_metrics = []
             for mini_index, indices in enumerate(minis):
                 update_started = time.monotonic()
                 rank_dir = directory / f"mini-{mini_index:02d}" / f"rank-{rank}"
@@ -426,7 +443,7 @@ def main():
                 if rank == 0:
                     metrics["memory/max_allocated_gib"] = max(m["allocated"] for m in memory) / 2**30
                     metrics["memory/max_reserved_gib"] = max(m["reserved"] for m in memory) / 2**30
-                    tracker.log(metrics, step=batch_index * len(minis) + mini_index + 1)
+                    mini_metrics.append(metrics)
                     save_json(directory / f"mini-{mini_index:02d}/summary.json", dict(metrics=metrics, update=result))
             completed_now = group_index + tasks_per_batch
             should_save = checkpoint_due(batch_index + 1, save_freq, final=completed_now == last_group)
@@ -469,14 +486,15 @@ def main():
                             removed_checkpoints=removed,
                         ),
                     )
-                    tracker.log(
+                    logged_metrics = sampling_batch_metrics(mini_metrics)
+                    logged_metrics.update(
                         {
                             "timing/batch_seconds": time.monotonic() - started,
                             "timing/checkpoint_seconds": time.monotonic() - save_started if should_save else 0,
                             "checkpoint/saved": int(should_save),
-                        },
-                        step=(batch_index + 1) * len(minis),
+                        }
                     )
+                    tracker.log(logged_metrics, step=batch_index + 1)
                     saved = dict(ok=True)
                 except Exception:
                     saved = dict(ok=False, error=traceback.format_exc())

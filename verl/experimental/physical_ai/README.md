@@ -107,7 +107,10 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
 按save_freq个完整采样batch保存完整policy、优化器、训练游标、数据/配置身份及各rank随机状态。
 正常结束或显式边界停止也保存；未配置save_freq的旧profile仍每批保存。
 `--resume /path/to/checkpoints/group-N/checkpoint.json`配合新output目录恢复；改变任务、
-配置或world size会拒绝。半组不能续接成旧物理经历，旧attempt目录保留，重新采样
+配置或world size默认会拒绝。迁移可显式传`--resume-migration approved.json`，
+其中`source_contract_sha256`/`target_contract_sha256`精确绑定两个契约；仅允许world size
+及已审核代码指纹差异，其他字段仍完全一致。恢复完整模型、AdamW和游标，ZeRO按新卡数
+重新分片；改变卡数时按seed+completed_groups*1000+rank重建随机流，不声称逐位复现。半组不能续接成旧物理经历，旧attempt目录保留，重新采样
 使用新目录。checkpoint先原子落盘并hash，最后写manifest，不接受半份文件。
 
 SwanLab走verl原生`Tracking`；密钥只从私有文件进入进程环境，不写配置和checkpoint。
@@ -165,7 +168,7 @@ SwanLab；当前原生后端不支持的开关设成其他值会报错，不能�
 参考：[verl GRPO](https://verl.readthedocs.io/en/latest/algo/grpo.html)、
 [官方配置](https://verl.readthedocs.io/en/latest/examples/config.html)。
 
-日志横轴为mini-batch尝试数，另有sampling_batch与实际optimizer_steps；全零优势
+日志横轴为采样batch数，每批仅写一个日志点；mini-batch指标汇总，梯度额外保留最大值与逐mini曲线，实际optimizer_steps单列。全零优势
 mini不更新参数，但仍记录奖励与采样进度。rollout指标覆盖包括零优势组的整个batch；
 actor的active_clip/ratio/old_policy_k3只统计真正反向的响应。old_policy_k3是相对
 采样旧策略的诊断，不能当reference KL。old_sampled_nll也不是完整词表精确entropy。

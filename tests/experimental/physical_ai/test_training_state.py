@@ -23,12 +23,14 @@ import torch
 from verl.experimental.physical_ai.training_state import (
     build_optimizer,
     checkpoint_due,
+    contract_hash,
     load_boundary,
     prune_checkpoints,
     restore_optimizer,
     save_boundary,
     training_budget,
     validate_fixed_algorithm,
+    validate_resume_contract,
 )
 
 
@@ -86,8 +88,83 @@ def _zero_adam_worker(rank, directory):
         dist.destroy_process_group()
 
 
+def _reshard_adam_worker(rank, directory):
+    """读取两rank合并存档，在八rank重分片后与完整AdamW逐参数比较。"""
+    import torch.distributed as dist
+
+    from verl.experimental.physical_ai.distributed import sum_gradients
+
+    directory = Path(directory)
+    dist.init_process_group("gloo", init_method="file://" + str(directory / "reshard"), rank=rank, world_size=8)
+    try:
+        config = dict(optimizer="adamw", learning_rate=0.01, optimizer_state_sharding=True, weight_decay=0.01)
+        state, _ = load_boundary(directory / "saved/checkpoint.json", config)
+        model = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 1))
+        reference = torch.nn.Sequential(torch.nn.Linear(3, 5), torch.nn.Tanh(), torch.nn.Linear(5, 1))
+        model.load_state_dict(state["model_state_dict"])
+        reference.load_state_dict(state["model_state_dict"])
+        opt = build_optimizer(model, config, distributed=True)
+        ref_opt = torch.optim.AdamW(reference.parameters(), lr=0.01, weight_decay=0.01, foreach=False)
+        from copy import deepcopy
+
+        ref_opt.load_state_dict(deepcopy(state["optimizer_state_dict"]))
+        restore_optimizer(opt, state["optimizer_state_dict"])
+        torch.manual_seed(77)
+        x, y = torch.randn(32, 3), torch.randn(32, 1)
+        (model(x[rank::8]) - y[rank::8]).square().sum().div(32).backward()
+        sum_gradients(model)
+        (reference(x) - y).square().mean().backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
+        opt.step()
+        ref_opt.step()
+        for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
+            torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-6)
+    finally:
+        dist.destroy_process_group()
+
+
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
+
+    def test_sampling_axis_keeps_update_count_and_spikes(self):
+        """每采样批仅一个日志点，更新累计数和逐mini尖峰不能被平均抹掉。"""
+        from verl.experimental.physical_ai.training_metrics import sampling_batch_metrics
+
+        rows = [
+            {
+                "train/sampling_batch": 5,
+                "train/optimizer_steps": 17 + i,
+                "train/optimizer_step_applied": 1,
+                "train/mini_batch": i + 1,
+                "actor/grad_norm": v,
+                "timing/mini_update_seconds": 2,
+            }
+            for i, v in enumerate([4, 8, 12, 16])
+        ]
+        result = sampling_batch_metrics(rows)
+        self.assertEqual(result["actor/grad_norm"], 10)
+        self.assertEqual(result["actor/grad_norm_max"], 16)
+        self.assertEqual(result["train/optimizer_steps"], 20)
+        self.assertEqual(result["train/optimizer_steps_this_batch"], 4)
+        self.assertEqual(result["mini_2/actor/grad_norm"], 8)
+        self.assertNotIn("train/mini_batch", result)
+        rows[0]["train/sampling_batch"] = 4
+        with self.assertRaises(ValueError):
+            sampling_batch_metrics(rows)
+
+    def test_explicit_topology_migration(self):
+        """批准须绑定精确代码/卡数版本，算法或数据变化即使重新签SHA也拒绝。"""
+        source = dict(config={"batch_size": 128}, world_size=2, implementation_files={"train.py": "old"})
+        target = dict(source, world_size=8, implementation_files={"train.py": "new"})
+        approval = dict(source_contract_sha256=contract_hash(source), target_contract_sha256=contract_hash(target))
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, target)
+        validate_resume_contract(source, target, approval)
+        bad = dict(target, config={"batch_size": 64})
+        approval["target_contract_sha256"] = contract_hash(bad)
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval)
 
     def test_batch_budget_and_safe_retention(self):
         """100批按10批保存；新写入失败不能删旧恢复点，keep=1不碰其他实验/未完成文件。"""
@@ -155,6 +232,7 @@ class TrainingStateTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(_zero_adam_worker, args=(directory,), nprocs=2, join=True)
+            mp.spawn(_reshard_adam_worker, args=(directory,), nprocs=8, join=True)
 
     def test_resume_matches_uninterrupted_optimizer(self):
         """连续两步与保存/重载后第二步应逐参数一致，任务/数据变化必须拒绝。"""

@@ -224,17 +224,44 @@ def save_boundary(policy, optimizer, directory, *, completed_groups, optimizer_s
     return receipt
 
 
-def load_boundary(manifest, contract):
+def contract_hash(contract):
+    """对训练契约做稳定SHA摘要，用于显式批准来源/目标代码及拓扑组合。"""
+    return hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_resume_contract(source, target, migration=None):
+    """默认要求完全相同；显式迁移只允许卡数及已确认代码指纹发生变化。
+
+    migration必须精确绑定来源与目标契约SHA。数据、算法配置、原始权重、处理器
+    等其他字段始终严格相同，不能把迁移当作跳过校验的开关。
+    """
+    if source == target and migration is None:
+        return
+    if migration is None or migration != {
+        "source_contract_sha256": contract_hash(source),
+        "target_contract_sha256": contract_hash(target),
+    }:
+        raise ValueError("恢复配置/数据或显式迁移批准不一致")
+    excluded = {"world_size", "implementation_files"}
+    if {k: v for k, v in source.items() if k not in excluded} != {k: v for k, v in target.items() if k not in excluded}:
+        raise ValueError("迁移不能改变训练配置/数据/权重")
+    if any(type(c.get("world_size")) is not int or c["world_size"] < 1 for c in (source, target)):
+        raise ValueError("迁移卡数必须为正整数")
+
+
+def load_boundary(manifest, contract, *, migration=None):
     """核验组边界checkpoint，再恢复；配置/数据/权重变化不能接着使用旧游标。
 
+    默认严格一致；migration显式批准拓扑及代码指纹变更，不能改变算法/数据。
     只加载本项目创建、已校验SHA的训练文件；weights_only保证不执行外来pickle对象。
     manifest中的路径允许跨机器重定位，但对应字节身份必须保持。
     """
     receipt = json.loads(Path(manifest).read_text())
-    if receipt["contract"] != contract or content_hash(receipt["path"]) != receipt["sha256"]:
-        raise ValueError("恢复配置/数据或checkpoint SHA不一致")
+    validate_resume_contract(receipt["contract"], contract, migration)
+    if content_hash(receipt["path"]) != receipt["sha256"]:
+        raise ValueError("checkpoint SHA不一致")
     state = torch.load(receipt["path"], map_location="cpu", weights_only=True)
-    if state["schema"] != "physical-ai.seggrpo-training.v1" or state["contract"] != contract:
+    if state["schema"] != "physical-ai.seggrpo-training.v1" or state["contract"] != receipt["contract"]:
         raise ValueError("checkpoint内部训练契约不同")
     for key in ("completed_groups", "optimizer_steps"):
         if state[key] != receipt[key]:

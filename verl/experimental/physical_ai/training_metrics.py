@@ -91,3 +91,44 @@ def update_metrics(result, records, indices):
             metrics[f"{prefix}/active_ratio_min"] = min(r["ratio_min"] for r in phase_rows)
             metrics[f"{prefix}/active_ratio_max"] = max(r["ratio_max"] for r in phase_rows)
     return metrics
+
+
+def sampling_batch_metrics(mini_metrics):
+    """把同一采样批的更新指标汇总为一个日志点，不改变优化计算。
+
+    输入为按更新顺序排列的等大小 mini-batch 指标字典。采样统计仅记一次，
+    累计计数取末值；actor 指标按提供该值的 mini-batch 等权平均，极值保留
+    min/max。另保留逐 mini 指标以便诊断，避免平均值掩盖梯度尖峰。
+    零优势跳过的更新不凭空补梯度值，实际更新次数单独求和。
+    """
+    if not mini_metrics:
+        raise ValueError("采样批没有更新记录")
+    batches = {m["train/sampling_batch"] for m in mini_metrics}
+    if len(batches) != 1:
+        raise ValueError("不能合并不同采样批的指标")
+    result = dict(mini_metrics[-1])
+    result.pop("train/mini_batch", None)
+    result.pop("train/optimizer_step_applied", None)
+    result["train/mini_batches"] = len(mini_metrics)
+    result["train/optimizer_steps_this_batch"] = sum(m["train/optimizer_step_applied"] for m in mini_metrics)
+    keys = set().union(*(m.keys() for m in mini_metrics))
+    for key in keys:
+        values = [m[key] for m in mini_metrics if key in m]
+        if key.startswith("actor/"):
+            result[key] = (
+                min(values)
+                if key.endswith("_min")
+                else max(values)
+                if key.endswith("_max")
+                else sum(values) / len(values)
+            )
+        elif key.startswith("memory/"):
+            result[key] = max(values)
+    if "actor/grad_norm" in result:
+        result["actor/grad_norm_max"] = max(m["actor/grad_norm"] for m in mini_metrics if "actor/grad_norm" in m)
+    result["timing/mini_update_seconds"] = sum(m["timing/mini_update_seconds"] for m in mini_metrics)
+    for index, metrics in enumerate(mini_metrics, 1):
+        for key, value in metrics.items():
+            if key.startswith("actor/"):
+                result[f"mini_{index}/{key}"] = value
+    return result
