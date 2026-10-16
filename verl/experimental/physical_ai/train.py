@@ -517,8 +517,10 @@ def main():
         if args.output.is_dir():
             save_json(args.output / f"fatal-rank-{rank}.json", detail)
             save_json(args.output / f"progress-rank-{rank}.json", dict(phase="failed", failure=detail))
-            save_json(args.output / "fatal.json", detail)
-            save_json(args.output / "progress.json", dict(phase="failed", failure_rank=rank))
+            # 公共文件只由rank0写；首因仍以各rank独立traceback为准，避免tmp路径争写。
+            if rank == 0:
+                save_json(args.output / "fatal.json", detail)
+                save_json(args.output / "progress.json", dict(phase="failed", failure_rank=rank))
         raise
     finally:
         if tracker is not None:

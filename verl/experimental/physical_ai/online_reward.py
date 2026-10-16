@@ -15,7 +15,9 @@
 """从同次交付快照计算GT并调用既有文本judge；评分数据不进入模型会话。"""
 
 import hashlib
+import logging
 import re
+import time
 from copy import deepcopy
 
 from benchmark.core.scene_graph import canonical
@@ -61,11 +63,12 @@ def public_text(text):
     return text.replace("<|im_end|>", "").strip()
 
 
-def score_answer(binding, answer, transport, *, rollout_id, max_attempts=3):
+def score_answer(binding, answer, transport, *, rollout_id, max_attempts=20):
     """仅审核已完成响应的原始公开答案；失败/unknown保持None，不能静默填0。
 
     rollout_id是父轨迹身份，多个QA分支共享交付GT，但答案和裁判请求各自独立保存。
-    max_attempts只重试相同答案，不重新生成或重跑机器人。没有格式/长度奖励。
+    max_attempts含首次请求，默认20次；失败后按5/10/20/40/60秒封顶退避。
+    只重试相同答案，不重新生成或重跑机器人；有效0分不重试，没有格式/长度奖励。
     """
     payload = {k: deepcopy(v) for k, v in binding.items() if k != "binding_sha256"}
     if set(binding) != {"rollout_id", "question", "gt", "binding_sha256"}:
@@ -75,7 +78,27 @@ def score_answer(binding, answer, transport, *, rollout_id, max_attempts=3):
         or hashlib.sha256(canonical(payload).encode()).hexdigest() != binding["binding_sha256"]
     ):
         raise ValueError("评分绑定被改动或属于其他轨迹")
-    result = judge_answer(binding["question"], binding["gt"], answer, transport, max_attempts=max_attempts)
+    calls = 0
+
+    def retry_transport(messages):
+        """仅在裁判已要求下一次重试时等待；不消耗策略随机数或改写消息。"""
+        nonlocal calls
+        if calls:
+            delay = min(5 * 2 ** min(calls - 1, 4), 60)
+            logging.getLogger(__name__).warning(
+                "QA judge retry %d/%d after %ds; parent=%s question=%s",
+                calls + 1,
+                max_attempts,
+                delay,
+                rollout_id,
+                binding["question"]["question_id"],
+            )
+            time.sleep(delay)
+        calls += 1
+        return transport(messages)
+
+    result = judge_answer(binding["question"], binding["gt"], answer, retry_transport, max_attempts=max_attempts)
+    result["retry_policy"] = dict(max_attempts=max_attempts, initial_delay_seconds=5, max_delay_seconds=60)
     return dict(
         result,
         delivery_binding_sha256=binding["binding_sha256"],

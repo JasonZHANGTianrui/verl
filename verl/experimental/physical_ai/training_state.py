@@ -260,7 +260,9 @@ def load_boundary(manifest, contract, *, migration=None):
     validate_resume_contract(receipt["contract"], contract, migration)
     if content_hash(receipt["path"]) != receipt["sha256"]:
         raise ValueError("checkpoint SHA不一致")
-    state = torch.load(receipt["path"], map_location="cpu", weights_only=True)
+    # 八rank读取同一完整存档时按需映射CPU storage，避免每rank再常驻一份完整副本。
+    # 默认私有映射；恢复优化器不改写不可变checkpoint文件。
+    state = torch.load(receipt["path"], map_location="cpu", weights_only=True, mmap=True)
     if state["schema"] != "physical-ai.seggrpo-training.v1" or state["contract"] != receipt["contract"]:
         raise ValueError("checkpoint内部训练契约不同")
     for key in ("completed_groups", "optimizer_steps"):

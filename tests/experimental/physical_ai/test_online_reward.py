@@ -18,6 +18,7 @@ import hashlib
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from benchmark.core.scene_graph import SceneRecorder, canonical
@@ -153,11 +154,31 @@ class OnlineRewardTests(unittest.TestCase):
             seen.append(json.dumps(messages, sort_keys=True))
             raise JudgeAPIError("HTTP 500")
 
-        result = score_answer(binding(), "No.", failing, rollout_id="parent-a", max_attempts=3)
+        with patch("verl.experimental.physical_ai.online_reward.time.sleep"):
+            result = score_answer(binding(), "No.", failing, rollout_id="parent-a", max_attempts=3)
         self.assertEqual(result["status"], "judge_error")
         self.assertIsNone(result["score"])
         self.assertEqual(len(seen), 3)
         self.assertEqual(len(set(seen)), 1)
+
+    def test_retry_recovers_on_twentieth_identical_request(self):
+        """模拟长期API故障后恢复：20次同一输入、退避封顶、有效0分立即返回。"""
+        seen = []
+
+        def transport(messages):
+            seen.append(json.dumps(messages, sort_keys=True))
+            if len(seen) < 20:
+                raise JudgeAPIError("HTTP 500")
+            return {"raw_response": json.dumps(dict(status="scored", score=0, reason="Wrong answer"))}
+
+        with patch("verl.experimental.physical_ai.online_reward.time.sleep") as sleep:
+            result = score_answer(binding(), "Yes.", transport, rollout_id="parent-a")
+        self.assertEqual(result["status"], "scored")
+        self.assertEqual(result["score"], 0)
+        self.assertEqual(len(seen), 20)
+        self.assertEqual(len(set(seen)), 1)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 10, 20, 40] + [60] * 15)
+        self.assertEqual(len(result["attempts"]), 20)
 
     def test_private_think_and_public_explanation(self):
         """只去掉显式私有think，保留公开解释；未闭合think不得混成答案。"""
