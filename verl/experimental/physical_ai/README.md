@@ -181,6 +181,19 @@ EGL只提供一个渲染后端；配置中的egl_device_id独立选择渲染设�
 EGL设备0，不改变各自模型的CUDA卡。运行环境须核对实际GL_RENDERER；不能把
 使用EGL自动等同于NVIDIA GPU渲染。
 
+多设备渲染可在部署核验后配置`egl_device_ids`列表，按本节点local_rank分配；
+列表必须覆盖全部本地worker，不从CUDA序号自动推测。设置
+`PHYSICAL_AI_REQUIRE_GL_VENDOR='NVIDIA Corporation'`可拒绝意外回退Mesa软件渲染。
+每个阶段的`phase.json`记录实际vendor/renderer/EGL序号，不能只以nvidia-smi有卡
+认定相机用了GPU。缺少NVIDIA图形库的容器可单独配置与内核驱动同版本的用户态
+EGL库，通过任务专用`LD_LIBRARY_PATH`和`__EGL_VENDOR_LIBRARY_FILENAMES`选择；
+资源版本/hash写部署记录，不覆盖系统库或改变其他任务环境。
+
+渲染后端变化须核对同动作的物理状态、逐步Scene map及实际画面；像素差异独立记录，
+不能承诺跨Mesa/NVIDIA逐像素相同。相机、光照、采样频率和模型输入时刻保持，
+每控制步照常记录图。SwanLab新增环境step、SceneCapture与视频写入的阶段均值/最大
+耗时（秒）；这些是逐轨迹累计，不是多卡墙钟时间，不可直接相加当整批耗时。
+
 采样/元数据/状态同步走独立Gloo组；模型梯度及ZeRO参数同步仍走NCCL。采样错误
 立即写fatal-rank-N.json并抛出，由torchrun终止其他worker，不先等待整批采完。
 progress同时标failed，避免只有rank0写异常而丢失rank1的最初报错。错误路径不
@@ -209,6 +222,12 @@ phase_steps是单条与批量路径共用的动作/工具/观察实现；run_pha
 允许每通道一个量化级的舍入差，按same-state-uint8-render-lsb-v1记录max_delta
 及changed_pixels，超过即拒绝。实际QA初始观察仍精确复制父回合原图，不能用
 这份复核渲染替换输入。分叉回执写入qa-N-fork.json，只作私有诊断。
+
+LIBERO炉灶的运行状态还包含`vis_site_names`标志与`MjModel.site_rgba`透明度，
+它们不在`MjData`内。分叉先通过`copy_visual_runtime`按上游已登记设备site复制
+这两项，再严格比较完整模型XML；RGB、几何、质量及未登记site差异仍拒绝。
+不调用设备谓词重算显示、不推进父环境，也不把上游透明度裁成另一数值。
+随后继续原有物理/相机/图像核验；记录`libero-registered-visual-state-v1`。
 
 当前部署使用单机4卡L40S。每卡依次采两个任务组，每组最多8条生成请求合批，
 全局采样batch仍是128条阶段序列；mini-batch32，两卡改四卡不改变任务/奖励权重。

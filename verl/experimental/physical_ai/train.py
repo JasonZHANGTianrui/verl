@@ -108,11 +108,9 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     runtime_config = json.loads(args.config.read_text())
-    # EGL设备序号与CUDA local_rank是两个命名空间；容器可能有两张计算卡但仅一个EGL设备。
-    # 默认沿渲染器的设备0，允许部署显式覆盖，不修改模型所在CUDA卡。
-    egl_device = runtime_config.get("egl_device_id", 0)
-    if type(egl_device) is not int or egl_device < 0:
-        raise ValueError("egl_device_id须是EGL枚举中的非负整数，不能使用CUDA rank推断")
+    from .libero_session import egl_device_for_rank
+
+    egl_device = egl_device_for_rank(runtime_config, local_rank, int(os.environ.get("LOCAL_WORLD_SIZE", world)))
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(egl_device)
     control_group = None
     if world > 1:

@@ -27,6 +27,69 @@ from verl.experimental.physical_ai.workspace import configure_workspace
 class SamplingTests(unittest.TestCase):
     """核对原生采样、批量缓存隔离、停止机制和环境渲染精度。"""
 
+    def test_egl_mapping_is_explicit_and_complete(self):
+        """显式非同序映射按local_rank读取，旧默认保留，缺设备不能自动回退软件渲染。"""
+        from verl.experimental.physical_ai.libero_session import egl_device_for_rank
+
+        self.assertEqual(egl_device_for_rank({}, 1, 2), 0)
+        self.assertEqual(egl_device_for_rank(dict(egl_device_id=3), 0, 2), 3)
+        self.assertEqual(egl_device_for_rank(dict(egl_device_ids=[3, 1]), 0, 2), 3)
+        self.assertEqual(egl_device_for_rank(dict(egl_device_ids=[3, 1]), 1, 2), 1)
+        for bad in ([0], [0, True], [0, -1], "0,1"):
+            with self.assertRaises(ValueError):
+                egl_device_for_rank(dict(egl_device_ids=bad), 0, 2)
+
+    def test_fork_copies_registered_visual_state_without_hiding_model_changes(self):
+        """设备alpha/标志独立复制；质量、RGB、未登记site或身份变化仍拒绝。"""
+        import json
+
+        import numpy as np
+
+        from verl.experimental.physical_ai.libero_session import copy_visual_runtime
+
+        def environment(alpha, visible):
+            """构造含一个设备site和一个普通site的模型，不依赖真实模拟器。"""
+            model = SimpleNamespace(
+                site_rgba=np.array([[0.9, 0.05, 0.05, alpha], [1., 1., 1., 0.]]), mass=1., geom_size=0.1
+            )
+            model.site_name2id = lambda name: {"stove_burner": 0, "ordinary": 1}[name]
+            model.get_xml = lambda: json.dumps(
+                dict(rgba=model.site_rgba.tolist(), mass=model.mass, geom_size=model.geom_size)
+            )
+            obj = SimpleNamespace(object_properties={"vis_site_names": {"burner": ("stove_burner", visible)}})
+            return SimpleNamespace(
+                sim=SimpleNamespace(model=model), visualization_sites_list=["stove"], get_object=lambda name: obj
+            )
+
+        parent, child = environment(2., True), environment(-1., False)
+        before = parent.sim.model.get_xml()
+        receipt = copy_visual_runtime(parent, child)
+        self.assertEqual(parent.sim.model.get_xml(), before)
+        self.assertEqual(child.sim.model.get_xml(), before)
+        self.assertEqual(receipt["sites"][0]["alpha"], 2.)
+        child.get_object("stove").object_properties["vis_site_names"]["burner"] = ("stove_burner", False)
+        self.assertTrue(parent.get_object("stove").object_properties["vis_site_names"]["burner"][1])
+        for change in ("mass", "geometry", "rgb", "unregistered_alpha", "site_identity", "registration"):
+            with self.subTest(change=change):
+                child = environment(-1., False)
+                if change == "mass":
+                    child.sim.model.mass = 2.
+                elif change == "geometry":
+                    child.sim.model.geom_size = 0.2
+                elif change == "rgb":
+                    child.sim.model.site_rgba[0, 0] = 0.1
+                elif change == "unregistered_alpha":
+                    child.sim.model.site_rgba[1, 3] = 1.
+                elif change == "site_identity":
+                    child.get_object("stove").object_properties["vis_site_names"]["burner"] = ("ordinary", False)
+                else:
+                    child.visualization_sites_list = []
+                with self.assertRaises(ValueError):
+                    copy_visual_runtime(parent, child)
+        parent.sim.model.site_rgba[0, 3] = np.nan
+        with self.assertRaises(ValueError):
+            copy_visual_runtime(parent, environment(-1., False))
+
     def test_interleaved_environments_activate_own_render_context(self):
         """交错读图必须先切本实例上下文；替换offscreen context后不继续使用旧对象。"""
         from verl.experimental.physical_ai.libero_session import bind_render_context

@@ -23,6 +23,29 @@ from copy import deepcopy
 import numpy as np
 
 
+def egl_device_for_rank(config, local_rank, local_world_size):
+    """读取部署已核验的EGL枚举映射，不假定CUDA序号就是EGL序号。
+
+    egl_device_ids按本节点local_rank给出设备ID，长度须与本节点进程数一致。
+    未指定列表时保留旧egl_device_id默认0；显式列表允许共享设备，但拒绝缺项、
+    布尔值或负数。硬件枚举/实际renderer检查在部署和环境创建时执行。
+    """
+    mapping = config.get("egl_device_ids")
+    if mapping is not None:
+        if (
+            not isinstance(mapping, list)
+            or len(mapping) != local_world_size
+            or not 0 <= local_rank < len(mapping)
+            or any(type(v) is not int or v < 0 for v in mapping)
+        ):
+            raise ValueError("egl_device_ids须逐本地rank提供有效EGL设备序号")
+        return mapping[local_rank]
+    device = config.get("egl_device_id", 0)
+    if type(device) is not int or device < 0:
+        raise ValueError("egl_device_id须是EGL枚举中的非负整数")
+    return device
+
+
 def bind_render_context(sim):
     """给本实例render绑定自己的EGL context，允许同一线程交错使用多个模拟器。
 
@@ -64,6 +87,50 @@ def compare_fork_image(parent, child):
     if result["max_delta"] > 1:
         raise ValueError(f"分叉渲染差异超出1个uint8量化级：{result}")
     return result
+
+
+def copy_visual_runtime(parent, child):
+    """复制LIBERO已登记设备的显示状态，再严格核对完整模型XML。
+
+    parent/child是底层LIBERO环境。炉灶会在执行中同时修改Python的
+    vis_site_names可见标志与MjModel.site_rgba透明度；它们不在MjData中，
+    不能靠clone_runtime恢复。这里只复制登记site的alpha，不复制RGB、几何、
+    质量或其他模型字段。名称/结构不符、非有限alpha或剩余XML差异均拒绝。
+    alpha原样保留：上游可将隐藏值-1翻为2，不能自行截断到[0,1]改变显示。
+    不推进仿真、不调用设备谓词，也不修改父环境；返回私有复制记录。
+    """
+    names = list(parent.visualization_sites_list)
+    if names != list(child.visualization_sites_list):
+        raise ValueError("分叉设备显示登记不同")
+    pending, records = [], []
+    for name in names:
+        source = parent.get_object(name).object_properties["vis_site_names"]
+        target = child.get_object(name).object_properties["vis_site_names"]
+        if source.keys() != target.keys():
+            raise ValueError("分叉设备显示部件不同：" + name)
+        for key, (site, visible) in source.items():
+            target_site, target_visible = target[key]
+            if site != target_site or type(visible) is not bool or type(target_visible) is not bool:
+                raise ValueError("分叉设备显示身份或标志无效：" + name)
+            source_id = parent.sim.model.site_name2id(site)
+            target_id = child.sim.model.site_name2id(site)
+            if source_id < 0 or source_id != target_id:
+                raise ValueError("分叉设备site映射不同：" + site)
+            alpha = float(parent.sim.model.site_rgba[source_id, 3])
+            if not np.isfinite(alpha):
+                raise ValueError("分叉设备显示alpha非有限：" + site)
+            pending.append((target_id, alpha))
+            records.append(dict(object=name, site=site, visible=visible, alpha=alpha))
+    # 仅给子环境恢复已登记的动态字段。其他任何差异仍会被原完整XML检查拒绝。
+    for site_id, alpha in pending:
+        child.sim.model.site_rgba[site_id, 3] = alpha
+    if parent.sim.model.get_xml() != child.sim.model.get_xml():
+        raise ValueError("环境模型XML不同，拒绝套用物理缓存")
+    for name in names:
+        child.get_object(name).object_properties["vis_site_names"] = deepcopy(
+            parent.get_object(name).object_properties["vis_site_names"]
+        )
+    return dict(rule="libero-registered-visual-state-v1", sites=records)
 
 
 class LiberoSession:
@@ -133,6 +200,17 @@ class LiberoSession:
             # 统一set_init_state已经刷新控制器和首观察，回执即本次任务第0步。
             self.preparation = deepcopy(self.env.preparation)
             bind_render_context(self.env.env.sim)
+            from OpenGL import GL
+
+            self.env.env.sim._render_context_offscreen.gl_ctx.make_current()
+            self.render_backend = dict(
+                vendor=GL.glGetString(GL.GL_VENDOR).decode(),
+                renderer=GL.glGetString(GL.GL_RENDERER).decode(),
+                egl_device_id=os.environ.get("MUJOCO_EGL_DEVICE_ID", "0"),
+            )
+            required = os.environ.get("PHYSICAL_AI_REQUIRE_GL_VENDOR")
+            if required and self.render_backend["vendor"] != required:
+                raise ValueError("实际渲染驱动不符合部署要求：" + str(self.render_backend))
             self.last_action = np.array([0.0] * 6 + [-1.0])
         except BaseException:
             self.close()
@@ -215,8 +293,9 @@ class LiberoSession:
     def fork(self):
         """建立同构环境副本，复制已验证的完整MjData/控制器缓存，父环境保持不动。
 
-        复用precision模式的clone_runtime，不用只含qpos/qvel的简化snapshot。模型XML
-        必须一致；复制后核对完整积分state及父/子即时渲染双图。该接口只在同一环境worker调用，
+        复用precision模式的clone_runtime，不用只含qpos/qvel的简化snapshot。先恢复
+        已登记设备的显示状态，其余模型XML必须一致；随后核对完整积分state及双图。
+        该接口只在同一环境worker调用，
         不是跨机器序列化协议；随机数状态恢复到分叉前，避免创建子环境改变后续随机流。
         """
         import random
@@ -228,8 +307,7 @@ class LiberoSession:
         child = None
         try:
             child = type(self)(**self.settings)
-            if self.env.env.sim.model.get_xml() != child.env.env.sim.model.get_xml():
-                raise ValueError("环境模型XML不同，拒绝套用物理缓存")
+            visual_runtime = copy_visual_runtime(self.env.env, child.env.env)
             clone_runtime(self.env, child.env)
             child.preparation = deepcopy(self.preparation)
             child.steps = self.steps
@@ -262,6 +340,7 @@ class LiberoSession:
                 if not np.array_equal(getattr(self.env.sim.data, name), getattr(child.env.sim.data, name)):
                     raise ValueError("分支渲染变换与父轨迹不同：" + name)
             child.fork_validation = dict(
+                visual_runtime=visual_runtime,
                 physical_state_equal=True,
                 render_transforms_equal=True,
                 initial_observation="exact_parent_copy",

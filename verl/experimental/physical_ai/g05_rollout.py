@@ -16,6 +16,7 @@
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,7 @@ def phase_steps(
     grip = LiberoGripperCommandState.from_obs(session.observe())
     responses, traces = [], []
     consumed = 0
+    timings = dict(environment_step_seconds=0.0, scene_capture_seconds=0.0, video_append_seconds=0.0)
     pending = False
     termination = "execution_budget"
     video = imageio.get_writer(str(directory / "scene.mp4"), fps=20, codec="libx264")
@@ -186,15 +188,21 @@ def phase_steps(
                 )
                 if action.shape != (7,) or not np.isfinite(action).all():
                     raise ValueError("decoded_control_invalid")
+                started = time.perf_counter()
                 session.observation, *_ = session.env.step(action)
+                timings["environment_step_seconds"] += time.perf_counter() - started
                 session.steps += 1
                 session.last_action = action.copy()
                 session.action_history.append(dict(step=session.steps, mode=mode, action=action.tolist()))
+                started = time.perf_counter()
                 if scene_capture is not None:
                     scene_capture.observe(session.steps)
                 elif recorder is not None:
                     recorder.observe(reader.read(session.steps))
+                timings["scene_capture_seconds"] += time.perf_counter() - started
+                started = time.perf_counter()
                 video.append_data(extract_libero_images(session.observation)["image"])
+                timings["video_append_seconds"] += time.perf_counter() - started
 
             results = []
             for request_index, request in enumerate(requests):
@@ -233,6 +241,8 @@ def phase_steps(
             answer="\n".join(t for t in responses if t),
             env_steps=session.steps - before_steps,
             generated_tokens=consumed,
+            timings=timings,
+            render_backend=session.render_backend,
         )
         save_json(
             directory / "controls.json",

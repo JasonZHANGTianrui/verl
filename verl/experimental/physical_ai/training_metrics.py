@@ -53,6 +53,11 @@ def rollout_metrics(records, artifacts, prepared):
                 f"{prefix}/advantage_max": max(advantages),
             }
         )
+        for key in ("environment_step_seconds", "scene_capture_seconds", "video_append_seconds"):
+            values = [artifacts[i].get("timings", {}).get(key) for i in ids]
+            if all(v is not None for v in values):
+                metrics[f"timing/{phase}/{key}_mean"] = sum(values) / len(values)
+                metrics[f"timing/{phase}/{key}_max"] = max(values)
     return metrics
 
 
