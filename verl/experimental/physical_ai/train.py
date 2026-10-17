@@ -173,6 +173,8 @@ def main():
         # 固定训练任务顺序只由身份与seed决定，与奖励、QA答案及SFT成败无关。
         eligible.sort(key=lambda t: hashlib.sha256(f"{config['seed']}:{t['id']}".encode()).hexdigest())
         _, resources = load_task_release(args.task_release, eligible[0]["id"])
+        from rollout.g05 import chat_libero
+
         contract = dict(
             config=config,
             tasks_sha256=content_hash(source),
@@ -193,7 +195,10 @@ def main():
                 if rank == 0
                 else None
             ),
-            implementation_files={p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
+            implementation_files={
+                **{p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
+                "rollout/g05/chat_libero.py": content_hash(Path(chat_libero.__file__)),
+            },
         )
         from ours.rl.prepare_online import validate_rebind
 

@@ -251,3 +251,8 @@ Mem仍未作为训练任务接入；公共监测器和clone支持不等于其奖
 `open_task_session`按发布契约核验真实恢复，`create_scene_capture`核对当前配置及
 准备后的完整状态，同组分支通过`assert_same_preparation`核对完整起点/控制状态。
 旧v1仍要求其预演回执，不能用缺字段的旧包冒充新模式。
+
+`thinking`须按checkpoint训练/测评模式显式选择；默认false保持旧模型兼容。
+with-think模型设true，只将新QA前缀置为开放的`<think>`，历史reasoning/动作/图像不删除。
+动作阶段保留原生裸assistant头，可自行生成思考；QA输出仅公开答案进入judge。
+LiveChat实现SHA写入运行契约，不能只换权重而继续沿用不匹配的聊天前缀。

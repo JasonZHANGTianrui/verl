@@ -51,6 +51,8 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     from .task_data import EVALUATION_ACTION_RULE, create_scene_capture, open_task_session, task_reward_at_delivery
 
     question = config["question"]
+    if type(config.get("thinking", False)) is not bool:
+        raise ValueError("thinking须为显式布尔值")
     task_index = None
     if task is None:
         suite = benchmark.get_benchmark_dict()[config["suite"]]()
@@ -132,7 +134,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 )
             elif condition != initial_digest:
                 raise ValueError("动作组初态不一致")
-            chat = LiveChat(policy, processor)
+            chat = LiveChat(policy, processor, thinking=config.get("thinking", False))
             chat.rl_processor = processor
             chat.rl_sampling_mode = config["sampling_mode"]
             chat.rl_compute_dtype = config["compute_dtype"]
