@@ -165,7 +165,9 @@ def main():
         torch.manual_seed(config["seed"] + rank)
         source = args.task_release / "train.jsonl"
         rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
-        eligible = [r for r in rows if r["environment"]["task_name"] == config["task_rule"]["task_name"]]
+        from .task_data import training_tasks
+
+        eligible = training_tasks(rows, config["task_rule"])
         if len(eligible) < tasks_per_batch:
             raise ValueError("已绑定动作奖励的训练记录不足一个batch")
         # 固定训练任务顺序只由身份与seed决定，与奖励、QA答案及SFT成败无关。
@@ -318,6 +320,9 @@ def main():
                 task = eligible[task_index % len(eligible)]
                 run_config = deepcopy(config)
                 run_config.update(
+                    execution_steps=config.get("execution_steps_by_suite", {}).get(
+                        task["environment"]["suite"], config["execution_steps"]
+                    ),
                     case_id=task["id"],
                     suite=task["environment"]["suite"],
                     task_name=task["environment"]["task_name"],

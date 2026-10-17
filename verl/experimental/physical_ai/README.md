@@ -230,3 +230,24 @@ phase_steps是单条与批量路径共用的动作/工具/观察实现；run_pha
 新旧任务只有online_execution差异，再允许任务文件hash变化。算法、权重、任务ID
 及顺序保持原值。这是新执行条件下的训练分支，不能冒充旧环境逐位续跑。
 Mem仍未作为训练任务接入；公共监测器和clone支持不等于其奖励/会话已经验收。
+
+### 完整普通LIBERO任务池
+
+`configs/libero2000-b128-m32-n8.json`显式选择
+`libero-native-at-question-delivery-v1`，与当前G0.5测评动作口径一致：用户QA交付前读取
+本次环境成功状态；不以native success提前结束、不补动作，QA后的动作不能反改此分。
+模型生成的非法工具指令按执行失败记录，环境/接口异常不转成能力零分。
+
+`task_data.training_tasks`在此模式保留整个训练任务池，逐题校验机械查询注册及参数。
+`online_reward.bind_delivery`原本已复用测评相同的注册表、PopContext与judge，沿用即可；
+不再添加第二套空间判据。旧设备状态小试按原profile继续可复现，不热改暂停运行。
+
+动作预算沿当前题库生成器：普通suite为300控制步，libero_10/90为520步；QA为32步。
+组大小n8+n8、batch128/mini32、100采样batch、save10/keep1保持。2000是任务池大小，
+100个batch实际选800个任务起点；新池需要新运行，不能沿旧50条任务池的恢复游标。
+新任务发布与真实采样验收完成前，不自动恢复训练。
+
+在线任务v2不要求每个初态提前跑一次。固定题目和每任务场景配置直接复用；
+`open_task_session`按发布契约核验真实恢复，`create_scene_capture`核对当前配置及
+准备后的完整状态，同组分支通过`assert_same_preparation`核对完整起点/控制状态。
+旧v1仍要求其预演回执，不能用缺字段的旧包冒充新模式。

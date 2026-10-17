@@ -68,6 +68,71 @@ class _UncopyableSim:
 class OnlineRewardTests(unittest.TestCase):
     """GT来源、裁判错误和物理副本的核心隔离检查。"""
 
+    def test_runtime_preparation_contract_is_explicit(self):
+        """取消逐样本预演不取消版本/seed/分辨率校验，旧回执模式继续严格读取。"""
+        from verl.experimental.physical_ai.task_data import needs_preparation_reference
+
+        online = dict(
+            schema="physical-ai.rl-online-execution.v2",
+            preparation_policy="verify_during_rollout",
+            seed=42,
+            resolution=256,
+        )
+        self.assertFalse(needs_preparation_reference(online, seed=42, resolution=256))
+        for changed in (
+            dict(online, seed=1),
+            dict(online, preparation_policy="skip"),
+            dict(online, preparation_ref="old"),
+        ):
+            with self.assertRaises(ValueError):
+                needs_preparation_reference(changed, seed=42, resolution=256)
+        old = dict(schema="physical-ai.rl-online-execution.v1", seed=42, resolution=256, preparation_ref="receipt")
+        self.assertTrue(needs_preparation_reference(old, seed=42, resolution=256))
+        del old["preparation_ref"]
+        with self.assertRaises(ValueError):
+            needs_preparation_reference(old, seed=42, resolution=256)
+
+    def test_evaluation_action_reward_reads_live_state_at_delivery(self):
+        """新模式直接读取当前物理结果；旧源标签和QA答案不能代替，运行异常不能抹零。"""
+        from verl.experimental.physical_ai.task_data import EVALUATION_ACTION_RULE, task_reward_at_delivery
+
+        task = dict(environment=dict(task_name="arbitrary", suite="libero_goal"), outcome=dict(success=True))
+        session = SimpleNamespace(env=object(), steps=25)
+        rule = dict(version=EVALUATION_ACTION_RULE)
+        with patch("benchmark.adapters.libero_execution.task_success", return_value=False) as read:
+            result = task_reward_at_delivery(task, rule, session, None, None, "model_text_end")
+            self.assertEqual(result["task_reward"], 0)
+            read.assert_called_once_with(session.env)
+        with patch("benchmark.adapters.libero_execution.task_success", return_value=True):
+            self.assertEqual(
+                task_reward_at_delivery(task, rule, session, None, None, "execution_budget")["task_reward"], 1
+            )
+            self.assertEqual(
+                task_reward_at_delivery(task, rule, session, None, None, "model_tool_error")["task_reward"], 0
+            )
+        with patch("benchmark.adapters.libero_execution.task_success", side_effect=RuntimeError("sim failed")):
+            with self.assertRaises(RuntimeError):
+                task_reward_at_delivery(task, rule, session, None, None, "model_text_end")
+
+    def test_evaluation_mode_preserves_task_pool_and_checks_each_query(self):
+        """不同动作任务均进入池；每条问题走同一注册表，不用动作目标代替QA查询。"""
+        from verl.experimental.physical_ai.task_data import EVALUATION_ACTION_RULE, training_tasks
+
+        rows = [
+            dict(
+                split="train",
+                environment=dict(task_name=name, suite="libero_goal"),
+                followup=dict(question_spec=dict(question_id=name)),
+            )
+            for name in ("open", "place", "close")
+        ]
+        with patch("benchmark.libero.questions.registry.default_registry") as factory:
+            self.assertEqual(training_tasks(rows, dict(version=EVALUATION_ACTION_RULE)), rows)
+            self.assertEqual(factory.return_value.validate.call_count, 3)
+            factory.return_value.validate.side_effect = ValueError("query not supported")
+            with self.assertRaises(ValueError):
+                training_tasks(rows, dict(version=EVALUATION_ACTION_RULE))
+
     def test_task_reward_is_independent_of_qa_and_old_result(self):
         """QA可以问数量，动作仍按当前设备状态计分；缺状态或错任务不能填零。"""
         task = dict(

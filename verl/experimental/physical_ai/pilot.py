@@ -48,7 +48,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     from .online_reward import bind_delivery, save_json, score_answer
     from .sampling import fork_chat, sample_response
     from .seggrpo import Segment, select_parent
-    from .task_data import create_scene_capture, open_task_session, state_task_reward
+    from .task_data import EVALUATION_ACTION_RULE, create_scene_capture, open_task_session, task_reward_at_delivery
 
     question = config["question"]
     task_index = None
@@ -71,11 +71,12 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     # 所有父环境保留到选中一个，再为每条QA建立独立副本；退出后统一释放再训练。
     with ExitStack() as stack:
         initial_digest = None
+        initial_preparation = None
         finished_execution = 0
 
         def execution(i):
             """一条真实动作分支；首次yield前初始化独立场景，结束后冻结该分支的GT。"""
-            nonlocal initial_digest, finished_execution
+            nonlocal initial_digest, initial_preparation, finished_execution
             rollout_id = f"execution-{i}"
             session = stack.enter_context(
                 open_task_session(
@@ -99,7 +100,10 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 else None
             )
             reader = capture.reader if capture is not None else LiberoSceneMap(session.env)
-            if config["task_rule"]["calibration"] != reader.config["version"]:
+            if (
+                config["task_rule"]["version"] != EVALUATION_ACTION_RULE
+                and config["task_rule"]["calibration"] != reader.config["version"]
+            ):
                 raise ValueError("任务状态规则与实际Scene map版本不同")
             recorder = (
                 capture.recorder
@@ -111,6 +115,15 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             if task is None and question["parameters"]["query"]["entity"] not in reader.nodes:
                 raise ValueError("题目实体未绑定到真实场景")
             condition = hashlib.sha256(session.env.sim.get_state().flatten().tobytes()).hexdigest()
+            # 初态在真实rollout现场核验：同组分支比较完整准备/控制状态，不需逐样本离线预演。
+            from copy import deepcopy
+
+            from benchmark.adapters.libero_execution import assert_same_preparation
+
+            if initial_preparation is None:
+                initial_preparation = deepcopy(session.preparation)
+            else:
+                assert_same_preparation(initial_preparation, session.preparation)
             if initial_digest is None:
                 initial_digest = condition
                 save_json(
@@ -138,7 +151,11 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 scene_capture=capture,
             )
             # 训练任务的QA原封不动复用；动作奖励读独立目标，不能把QA答案当任务完成。
-            task_result = state_task_reward(task, config["task_rule"], reader, recorder) if task else None
+            task_result = (
+                task_reward_at_delivery(task, config["task_rule"], session, reader, recorder, phase["termination"])
+                if task
+                else None
+            )
             binding = bind_delivery(question, recorder, config["entity_names"], rollout_id)
             private_history = recorder.export()
             save_json(directory / "delivery.json", private_history["questions"][question["question_id"]])
@@ -318,10 +335,15 @@ def main():
         if task is None and config["split"] != "debug":
             raise ValueError("此单组诊断只接受debug case，不是正式训练任务表")
         if task is not None:
-            if config["task_rule"]["task_name"] != task["environment"]["task_name"]:
+            from .task_data import training_tasks
+
+            if training_tasks([task], config["task_rule"]) != [task]:
                 raise ValueError("配置的任务规则不能套到其他训练任务")
             config.update(
                 split="train",
+                execution_steps=config.get("execution_steps_by_suite", {}).get(
+                    task["environment"]["suite"], config["execution_steps"]
+                ),
                 case_id=task["id"],
                 suite=task["environment"]["suite"],
                 task_name=task["environment"]["task_name"],
