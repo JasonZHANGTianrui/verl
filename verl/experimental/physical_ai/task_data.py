@@ -72,7 +72,7 @@ def task_reward_at_delivery(task, rule, session, reader, recorder, termination):
     """在追加用户QA之前计算动作分；新模式对应当前G0.5测评的同一采样时刻。
 
     原生success只读取当前环境，不提前停机器人、不补动作。模型生成的非法工具
-    指令记执行失败；环境/接口异常仍向外抛出，不能变成零分。QA动作不反改此分。
+    指令不执行，按实际环境结果计分并照常续问；环境/接口异常不能变成零分。QA不反改此分。
     这是显式的测评兼容版本，不冒充尚未统一接入的自定义任务判据。
     """
     if rule["version"] != EVALUATION_ACTION_RULE:
@@ -84,7 +84,7 @@ def task_reward_at_delivery(task, rule, session, reader, recorder, termination):
     native = bool(task_success(session.env))
     valid_output = termination not in {"model_tool_error", "model_action_decode_error"}
     return dict(
-        task_reward=float(native and valid_output),
+        task_reward=float(native),
         native_success=native,
         model_output_valid=valid_output,
         rule=rule,

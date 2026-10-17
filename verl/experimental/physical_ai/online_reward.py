@@ -60,7 +60,7 @@ def public_text(text):
     # 模板可能已经提供think起始标签，模型仅生成结束标签；这一段仍是私有思考。
     if "</think>" in text:
         text = text.split("</think>", 1)[1]
-    return text.replace("<|im_end|>", "").strip()
+    return text.replace("<|im_end|>", "").replace("<|endoftext|>", "").strip()
 
 
 def score_answer(binding, answer, transport, *, rollout_id, max_attempts=20):

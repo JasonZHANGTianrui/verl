@@ -108,7 +108,7 @@ class OnlineRewardTests(unittest.TestCase):
                 task_reward_at_delivery(task, rule, session, None, None, "execution_budget")["task_reward"], 1
             )
             self.assertEqual(
-                task_reward_at_delivery(task, rule, session, None, None, "model_tool_error")["task_reward"], 0
+                task_reward_at_delivery(task, rule, session, None, None, "model_tool_error")["task_reward"], 1
             )
         with patch("benchmark.adapters.libero_execution.task_success", side_effect=RuntimeError("sim failed")):
             with self.assertRaises(RuntimeError):

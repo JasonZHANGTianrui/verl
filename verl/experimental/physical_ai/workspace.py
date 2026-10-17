@@ -52,4 +52,9 @@ def configure_workspace():
         )
     ]
     sys.path[:0] = [path for path in paths if path not in sys.path]
+    source = os.environ.get("PHYSICAL_AI_G05_HANDOFF")
+    if source:
+        from .native_runtime import configure_handoff
+
+        configure_handoff(root, source)
     return root

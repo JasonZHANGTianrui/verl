@@ -66,5 +66,11 @@
     "libero_goal": 300,
     "libero_10": 520,
     "libero_90": 520
-  }
+  },
+  "model_interface": "reactpi-v1-d0bdbf2",
+  "thinking": false,
+  "execution_token_scope": "message",
+  "execution_max_calls": 60,
+  "qa_max_calls": 2,
+  "generation_timeout_seconds": 120
 }

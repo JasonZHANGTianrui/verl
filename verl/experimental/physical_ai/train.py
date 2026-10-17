@@ -173,10 +173,16 @@ def main():
         # 固定训练任务顺序只由身份与seed决定，与奖励、QA答案及SFT成败无关。
         eligible.sort(key=lambda t: hashlib.sha256(f"{config['seed']}:{t['id']}".encode()).hexdigest())
         _, resources = load_task_release(args.task_release, eligible[0]["id"])
-        from rollout.g05 import chat_libero
+        from .native_runtime import identity as model_interface_identity
 
+        if (
+            config.get("model_interface") == "reactpi-v1-d0bdbf2"
+            and model_interface_identity().get("commit") != "d0bdbf298a6a7f50b67e213111ff5c65f20a70ca"
+        ):
+            raise ValueError("完整任务池需要固定ReActPI v1交接，不能回退共享早期接口")
         contract = dict(
             config=config,
+            model_interface=model_interface_identity(),
             tasks_sha256=content_hash(source),
             world_size=world,
             eligible_ids=[r["id"] for r in eligible],
@@ -197,7 +203,6 @@ def main():
             ),
             implementation_files={
                 **{p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
-                "rollout/g05/chat_libero.py": content_hash(Path(chat_libero.__file__)),
             },
         )
         from ours.rl.prepare_online import validate_rebind

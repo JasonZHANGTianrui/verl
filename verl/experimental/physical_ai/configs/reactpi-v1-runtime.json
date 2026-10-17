@@ -1,0 +1,19 @@
+{
+  "commit": "d0bdbf298a6a7f50b67e213111ff5c65f20a70ca",
+  "files": {
+    "data-pipeline/rollout/g05/chat_libero.py": "2f047bf8fec9198006f83bb43c6d9d2cff3564aa07b802eb097f235f5ede0652",
+    "training-pipeline/ours/g05/inference.py": "6bcdde89b2d82047df3e3469859df5b707491c5f16d2f86d858817d1c54abf54",
+    "training-pipeline/ours/g05/runtime.py": "b2e794b393048b9b6f55611b75fe8ecd86ea01f43bd19a09474ace7b7c7201d6",
+    "training-pipeline/ours/g05/chat_template.py": "fc9b126176afde48165d3c67e532fcc7c6855402fe2c6f04f15e0e3aed148e53",
+    "training-pipeline/ours/g05/compiler.py": "27ec06125eb05dcd9859466953712673807f68786de389d4b7b985e31b68f7ac",
+    "training-pipeline/ours/g05/tool_calls.py": "5b4af270d3cb20b6de4336a007b65c43af0c07cc7dbcb73e28475b4b2c5cbac8",
+    "training-pipeline/ours/g05/generate.py": "a0f7b4854030146c1f3568f713b19fc4eb1c2489d4046051293ad740c5f012dd",
+    "training-pipeline/ours/g05_ar_only.py": "abdfd5915869977fab58ea30d99d62e9abfac946018999e66cd8ac92ff7571e5",
+    "data-pipeline/ours/sft/conversation.py": "0a9e639fbbfe696120468b6ef1ee80fce03588a53f38a990a525bfede7355906"
+  },
+  "upstream_files": {
+    "scripts/serve_policy.py": "77b942ac55cfd49fa306faa5a4c3b544ce136091329f4faf90aacd70a264eebb",
+    "experiments/libero/libero_eval_utils.py": "0b6598b1f178a7e0c878172dbefee28173591119b580f7704a51efc929e465dc",
+    "src/g05/tokenizer/models/actioncodec2_v2/wrapper.py": "a4b3c84b70f9cbffa604dd918e8ccdac8dbf9038987131424d72bbb81b5b453f"
+  }
+}

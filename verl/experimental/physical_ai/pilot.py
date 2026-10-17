@@ -40,7 +40,10 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     from benchmark.scoring.llm_judge import JudgeClient
     from experiments.libero.libero_eval_utils import build_libero_raw_obs
     from libero.libero import benchmark
-    from rollout.g05.chat_libero import LiveChat
+
+    from .native_runtime import live_chat_class
+
+    LiveChat = live_chat_class()
 
     from .batched_sampling import run_phases
     from .g05_rollout import chat_fingerprint, phase_steps
@@ -134,7 +137,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 )
             elif condition != initial_digest:
                 raise ValueError("动作组初态不一致")
-            chat = LiveChat(policy, processor, thinking=config.get("thinking", False))
+            chat = LiveChat(policy, processor, **({"thinking": True} if config.get("thinking", False) else {}))
             chat.rl_processor = processor
             chat.rl_sampling_mode = config["sampling_mode"]
             chat.rl_compute_dtype = config["compute_dtype"]
@@ -151,6 +154,9 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 reader=reader,
                 recorder=recorder,
                 scene_capture=capture,
+                max_calls=config.get("execution_max_calls"),
+                per_message_budget=config.get("execution_token_scope") == "message",
+                timeout_seconds=config.get("generation_timeout_seconds", 180),
             )
             # 训练任务的QA原封不动复用；动作奖励读独立目标，不能把QA答案当任务完成。
             task_result = (
@@ -162,8 +168,6 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             private_history = recorder.export()
             save_json(directory / "delivery.json", private_history["questions"][question["question_id"]])
             save_json(directory / "scene-map.json", private_history)
-            if binding["gt"]["status"] != "ok":
-                raise ValueError("任务/QA语义状态未知，不能填零奖励")
             if task_result is None:
                 state = binding["gt"]["value"]
                 if state not in ["open", "closed", "partially_open"]:
@@ -186,7 +190,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             phase["inputs_path"] = str(directory / "inputs.pt")
             save_json(
                 directory / "reward.json",
-                dict(**task_result, binding=binding, native_success=session.audit()["native_success"]),
+                {**task_result, "binding": binding, "native_success": session.audit()["native_success"]},
             )
             finished_execution += 1
             save_json(
@@ -204,6 +208,8 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         selected = select_parent(records, seed=config["seed"], mode="uniform")
         parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
         session, chat, phase, binding = parents[parent_index]
+        if binding["gt"]["status"] != "ok":
+            raise ValueError("选定父经历GT未知，保留原组，不能重选父轨迹或填零")
         # 未选中的真实轨迹/GT已经落盘，之后不再执行这些环境；及时释放其EGL资源。
         # 只关闭环境，不删除原会话/动作记录，也不按奖励改变父轨迹选择。
         for index, parent in enumerate(parents):
@@ -256,6 +262,8 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     directory=directory,
                     generated=phase["generated"],
                     old_logprobs=phase["old_logprobs"],
+                    max_calls=config.get("qa_max_calls"),
+                    timeout_seconds=config.get("generation_timeout_seconds", 180),
                 )
                 judgment = score_answer(binding, answer["answer"], client, rollout_id=selected)
                 save_json(directory / "judge.json", judgment)

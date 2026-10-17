@@ -52,11 +52,14 @@ def phase_steps(
     recorder=None,
     reader=None,
     scene_capture=None,
+    max_calls=None,
+    per_message_budget=False,
+    timeout_seconds=120,
 ):
     """采集一个阶段并保存全部原始生成ID与概率，工具观察不标成策略输出。
 
     session/chat已经包含合法前缀，QA可从完整动作历史副本继续。env_steps是本阶段
-    允许的真实20Hz控制/保持步，token_budget为本阶段总生成上限。原生成功不提前停。
+    允许的真实20Hz控制/保持步，QA的token_budget为阶段累计上限；动作可显式按单消息计。原生成功不提前停。
     仅正常无工具响应或执行预算耗尽结束阶段；错误工具输出记录为模型错误而不补动作。
     每个模型调用以yield交给调度器，收到原token/概率后继续实际执行；多个generator
     可在同一owner线程交错运行，使独立会话的生成请求形成GPU batch。
@@ -69,17 +72,14 @@ def phase_steps(
         extract_libero_images,
         single_action_to_libero_action,
     )
-    from inference import CachedSession
     from rollout.g05.tool_runtime import (
-        ActionDecodeError,
-        append_feedback,
-        bind_action_ids,
         current_proprio,
         decode_segment,
         execute_segments,
-        parse_request,
     )
     from runtime import to_device
+
+    from .native_runtime import cached_session
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
@@ -92,7 +92,7 @@ def phase_steps(
     prefix_length = len(chat.ids)
     before_steps = session.steps
     history_start = len(session.action_history)
-    engine = CachedSession(chat.policy.model)
+    engine = cached_session(chat.policy.model)
     rng = torch.Generator(device="cuda").manual_seed(seed)
     eos = chat.tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
     stop_ids = [eos, chat.policy.model.cfg.eos_token_id]
@@ -104,9 +104,16 @@ def phase_steps(
     video = imageio.get_writer(str(directory / "scene.mp4"), fps=20, codec="libx264")
     video.append_data(extract_libero_images(session.observation)["image"])
     try:
-        while consumed < token_budget and session.steps - before_steps < env_steps:
+        while (
+            (per_message_budget or consumed < token_budget)
+            and session.steps - before_steps < env_steps
+            and (max_calls is None or len(traces) < max_calls)
+        ):
             inputs = to_device(chat.inputs(), torch.device("cuda"))
-            budget = min(token_budget - consumed, int(engine.model.cfg.vlm.max_position_embeddings) - len(chat.ids))
+            budget = min(
+                token_budget if per_message_budget else token_budget - consumed,
+                int(engine.model.cfg.vlm.max_position_embeddings) - len(chat.ids),
+            )
             if budget < 1:
                 raise RuntimeError("native_context_capacity_exhausted")
             response = yield dict(
@@ -118,10 +125,25 @@ def phase_steps(
                 generator=rng,
                 mode=chat.rl_sampling_mode,
                 compute_dtype=chat.rl_compute_dtype,
+                timeout_seconds=timeout_seconds,
             )
             ids = response["ids"]
             text = chat.tokenizer.decode(ids, skip_special_tokens=False)
-            trace = dict(phase=phase, start_step=session.steps, input_tokens=len(chat.ids), text=text, **response)
+            trace = dict(
+                phase=phase,
+                start_step=session.steps,
+                input_tokens=len(chat.ids),
+                text=text,
+                exact_stop_token_id=ids[-1] if ids else None,
+                exact_stop_kind=(
+                    "message_end"
+                    if ids and ids[-1] == eos
+                    else "native_eos"
+                    if ids and ids[-1] == chat.policy.model.cfg.eos_token_id
+                    else response["termination"]
+                ),
+                **response,
+            )
             save_json(directory / f"call-{len(traces):03d}.json", trace)
             traces.append(trace)
             if response["termination"] != "message_end":
@@ -131,27 +153,14 @@ def phase_steps(
             old_logprobs.extend(response["logprobs"])
             consumed += len(ids)
             pending = False
-            try:
-                request = parse_request(text)
-                if request is not None:
-                    request = bind_action_ids(request, ids, chat.tokenizer, chat.policy.action_tokenizer)
-            except (ValueError, ActionDecodeError):
-                from tool_calls import TAGS
+            from .tool_messages import append_results, message_requests
 
-                tag = TAGS.search(text)
-                if tag:
-                    responses.append(public_text(text[: tag.start()]))
-                termination = "model_tool_error"
+            requests, ordinary, rejected = message_requests(text, ids, chat.tokenizer, chat.policy.action_tokenizer)
+            save_json(directory / f"tool-requests-{len(traces):03d}.json", dict(accepted=requests, rejected=rejected))
+            responses.append(public_text(ordinary))
+            if not requests:
+                termination = "model_tool_error" if rejected else "model_text_end"
                 break
-            if request is None:
-                responses.append(public_text(text))
-                termination = "model_text_end"
-                break
-            from tool_calls import TAGS
-
-            match = TAGS.search(text)
-            if match:
-                responses.append(public_text(text[: match.start()]))
 
             # LiveChat保存的是单本体processor；原decode_segment需要完整processor容器。
             processor = getattr(chat, "rl_processor", None)
@@ -187,24 +196,32 @@ def phase_steps(
                     recorder.observe(reader.read(session.steps))
                 video.append_data(extract_libero_images(session.observation)["image"])
 
-            execution = execute_segments(
-                request,
-                env_steps - (session.steps - before_steps),
-                decode,
-                step,
-                hold=lambda: hold_control_targets(session.env),
-            )
-            save_json(directory / f"execution-{len(traces):03d}.json", execution)
-            raw, _ = build_libero_raw_obs(session.observation, session.task)
-            append_feedback(chat, raw, request, execution, session.steps)
+            results = []
+            for request_index, request in enumerate(requests):
+                remaining = env_steps - (session.steps - before_steps)
+                execution = execute_segments(
+                    request, remaining, decode, step, hold=lambda: hold_control_targets(session.env)
+                )
+                save_json(directory / f"execution-{len(traces):03d}-{request_index:02d}.json", execution)
+                if execution["error"] and not execution["consumed_steps"]:
+                    continue
+                raw, _ = build_libero_raw_obs(session.observation, session.task)
+                results.append((request, execution, session.steps, raw))
+            if not results:
+                termination = "model_action_decode_error"
+                break
+            append_results(chat, results)
             generated.extend([False] * (len(chat.ids) - len(generated)))
             old_logprobs.extend([0.0] * (len(chat.ids) - len(old_logprobs)))
             pending = True
-            if execution["error"]:
-                termination = "model_action_decode_error"
-                break
         else:
-            termination = "execution_budget" if session.steps - before_steps >= env_steps else "token_budget"
+            termination = (
+                "execution_budget"
+                if session.steps - before_steps >= env_steps
+                else "message_budget"
+                if max_calls is not None and len(traces) >= max_calls
+                else "token_budget"
+            )
         result = dict(
             phase=phase,
             prefix_length=prefix_length,
