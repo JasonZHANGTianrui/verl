@@ -216,6 +216,70 @@ class TrainingStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_resume_contract(source, bad, approval(bad))
 
+    def test_two_approved_migrations_keep_both_checks(self):
+        """旧完整存档连续跨两次修复；改算法、伪造中间契约或嵌套链均拒绝。"""
+        from copy import deepcopy
+
+        source = dict(
+            world_size=8,
+            tasks_sha256="source",
+            config=dict(learning_rate=1e-6, task_rule={"version": "libero-native-at-question-delivery-v1"}),
+        )
+        middle = deepcopy(source)
+        middle["config"].update(
+            unknown_qa_policy="retain_action_skip_qa_group",
+            task_rule={"version": "libero-shared-at-question-delivery-v1"},
+        )
+        middle["task_success_implementation"] = dict(
+            version="libero-task-success-v1", files={"task-success-v1.json": "registry"}
+        )
+        target = deepcopy(middle)
+        target.update(
+            tasks_sha256="target",
+            task_rebind=dict(
+                source_tasks_sha256="source", target_tasks_sha256="target", preserved_tasks_sha256="same"
+            ),
+            execution_boundary=dict(
+                version="rl-source-start-and-fork-v1",
+                wait_for_stability=False,
+                refresh="libero-refresh-preserve-sampling-v1",
+            ),
+        )
+        chain = dict(
+            schema="physical-ai.gs-resume-chain.v1",
+            intermediate_contract=middle,
+            steps=[
+                dict(
+                    source_contract_sha256=contract_hash(source),
+                    target_contract_sha256=contract_hash(middle),
+                    protocol_revision="gs-v1.1-unknown-qa-v1",
+                ),
+                dict(
+                    source_contract_sha256=contract_hash(middle),
+                    target_contract_sha256=contract_hash(target),
+                    protocol_revision="gs-v1.1-source-start-v1",
+                    online_execution_rebind=True,
+                ),
+            ],
+        )
+        validate_resume_contract(source, target, chain)
+        bad = deepcopy(target)
+        bad["config"]["learning_rate"] = 1e-3
+        approval = deepcopy(chain)
+        approval["steps"][1]["target_contract_sha256"] = contract_hash(bad)
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval)
+        for change in ("middle", "nested", "order"):
+            bad_chain = deepcopy(chain)
+            if change == "middle":
+                bad_chain["intermediate_contract"]["world_size"] = 4
+            if change == "nested":
+                bad_chain["steps"][0]["schema"] = "physical-ai.gs-resume-chain.v1"
+            if change == "order":
+                bad_chain["steps"].reverse()
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, target, bad_chain)
+
     def test_sampling_axis_keeps_update_count_and_spikes(self):
         """每采样批仅一个日志点，更新累计数和逐mini尖峰不能被平均抹掉。"""
         from verl.experimental.physical_ai.training_metrics import sampling_batch_metrics

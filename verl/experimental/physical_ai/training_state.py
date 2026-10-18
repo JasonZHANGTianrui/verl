@@ -241,6 +241,24 @@ def validate_resume_contract(source, target, migration=None):
     仅接由原任务逐字段核验的新在线条件；任务ID/算法/源权重必须保持。
     协议例外分别为GS-10/未知QA和GS-02/06起点/分叉修复；其余优化/采样参数不变。
     """
+    if migration is not None and migration.get("schema") == "physical-ai.gs-resume-chain.v1":
+        # 最近完整存档可能早于两次已批准修复。按实际中间运行契约逐段复用已有校验，
+        # 不重写checkpoint元数据、不把多段迁移变成宽泛的忽略字段开关。
+        if set(migration) != {"schema", "intermediate_contract", "steps"}:
+            raise ValueError("迁移链字段不完整或含未知字段")
+        steps, middle = migration["steps"], migration["intermediate_contract"]
+        if (
+            not isinstance(middle, dict)
+            or not isinstance(steps, list)
+            or len(steps) != 2
+            or any(not isinstance(step, dict) or "schema" in step for step in steps)
+            or [step.get("protocol_revision") for step in steps]
+            != ["gs-v1.1-unknown-qa-v1", "gs-v1.1-source-start-v1"]
+        ):
+            raise ValueError("只接受已授权的共同成功/未知QA→源起点两段迁移")
+        validate_resume_contract(source, middle, steps[0])
+        validate_resume_contract(middle, target, steps[1])
+        return
     if source == target and migration is None:
         return
     expected = {
