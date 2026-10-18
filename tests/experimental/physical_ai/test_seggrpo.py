@@ -21,7 +21,13 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.experimental.physical_ai.batching import minibatch_indices, namespace_group, prepare_batch
-from verl.experimental.physical_ai.seggrpo import Segment, segment_advantages, segmented_policy_loss, select_parent
+from verl.experimental.physical_ai.seggrpo import (
+    UNSCORED_QA,
+    Segment,
+    segment_advantages,
+    segmented_policy_loss,
+    select_parent,
+)
 from verl.experimental.physical_ai.training_metrics import rollout_metrics, update_metrics
 
 
@@ -54,6 +60,52 @@ def fixture():
 
 class SegGRPOTests(unittest.TestCase):
     """针对分组、反向和选择偏置测试，而不是只验证字段名字。"""
+
+    def test_unknown_qa_is_null_and_has_no_gradient_without_diluting_valid_groups(self):
+        """保留完整QA槽位和采样记录；其null奖励不稀释其他QA，动作梯度不变。"""
+        base, mask = fixture()
+        skipped = [replace(r, reward=None, reward_status=UNSCORED_QA) if r.phase == "qa" else r for r in base]
+        rows = namespace_group(skipped, "unknown") + namespace_group(base, "known")
+        masks = torch.cat((mask, mask))
+        artifacts = [dict(generated=[False] + m.tolist(), old_logprobs=[0.0] + [-1.0] * len(m)) for m in masks]
+        batch = prepare_batch(rows, artifacts)
+        self.assertEqual([len(x) for x in minibatch_indices(rows, 4)], [4, 4])
+        self.assertTrue(bool(batch["sampled"][2:4].any()))
+        self.assertFalse(bool(batch["active"][2:4].any()))
+        self.assertFalse(bool(batch["advantages"][2:4].any()))
+        metrics = rollout_metrics(rows, artifacts, batch)
+        self.assertEqual(metrics["rollout/qa/reward_mean"], 0.5)
+        self.assertEqual(metrics["rollout/qa/scored_sequences"], 2)
+        self.assertEqual(metrics["rollout/qa/unscored_groups"], 1)
+        cfg = OmegaConf.create(
+            dict(clip_ratio=0.2, clip_ratio_low=None, clip_ratio_high=None, clip_ratio_c=3.0, global_batch_info={})
+        )
+        old = torch.full((8, 8), -1.0)
+        current = old.clone().requires_grad_()
+        loss, _ = segmented_policy_loss(rows, old, current, masks, actor_config=cfg)
+        loss.backward()
+        reference = old[4:].clone().requires_grad_()
+        reference_loss, _ = segmented_policy_loss(rows[4:], old[4:], reference, mask, actor_config=cfg)
+        reference_loss.backward()
+        torch.testing.assert_close(current.grad[2:4], torch.zeros_like(current.grad[2:4]))
+        torch.testing.assert_close(current.grad[6:], reference.grad[2:])
+        torch.testing.assert_close(current.grad[:2] + current.grad[4:6], reference.grad[:2])
+        # 整个mini只有动作可评分仍能反向；QA准确率缺省，不能画成0分。
+        only = prepare_batch(rows[:4], artifacts[:4])
+        self.assertNotIn("rollout/qa/reward_mean", rollout_metrics(rows[:4], artifacts[:4], only))
+        value = old[:4].clone().requires_grad_()
+        partial_loss, _ = segmented_policy_loss(rows[:4], old[:4], value, mask, actor_config=cfg)
+        partial_loss.backward()
+        self.assertTrue(bool(value.grad[:2].abs().sum()))
+        self.assertFalse(bool(value.grad[2:].abs().sum()))
+        # 只跳过一条QA、把动作标成unknown、或者给unknown奖励0仍是错误。
+        for wrong in (
+            skipped[:3] + [base[3]],
+            [replace(skipped[0], reward=None, reward_status=UNSCORED_QA)] + skipped[1:],
+            skipped[:3] + [replace(skipped[3], reward=0)],
+        ):
+            with self.assertRaises(ValueError):
+                segment_advantages(wrong, mask)
 
     def test_metrics_preserve_zero_groups_and_exclude_qa_prefix(self):
         """零优势仍计入总体奖励；QA长度/优势只取QA阶段，日志函数不修改准备数据。"""

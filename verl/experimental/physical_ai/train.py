@@ -203,6 +203,22 @@ def main():
                 **{p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
             },
         )
+        if config["task_rule"]["version"] == "libero-shared-at-question-delivery-v1":
+            from benchmark.adapters import libero_placement, libero_success
+            from benchmark.scoring import placement_success
+
+            contract["task_success_implementation"] = dict(
+                version=libero_success.VERSION,
+                files={
+                    Path(p).name: content_hash(Path(p))
+                    for p in (
+                        libero_success.__file__,
+                        libero_placement.__file__,
+                        placement_success.__file__,
+                        libero_success.REGISTRY,
+                    )
+                },
+            )
         from ours.rl.prepare_online import validate_rebind
 
         task_rebind = validate_rebind(args.task_release, rows)

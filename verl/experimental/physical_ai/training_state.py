@@ -66,6 +66,10 @@ def validate_fixed_algorithm(config):
     for key, value in fixed.items():
         if config.get(key, value) != value:
             raise ValueError(f"当前原生后端尚不支持{key}={config[key]!r}")
+    policy = config.get("unknown_qa_policy", "stop")
+    if policy not in {"stop", "retain_action_skip_qa_group"}:
+        raise ValueError("未知QA组处理策略")
+    fixed["unknown_qa_policy"] = policy
     return fixed
 
 
@@ -230,11 +234,12 @@ def contract_hash(contract):
 
 
 def validate_resume_contract(source, target, migration=None):
-    """默认要求完全相同；显式迁移只允许卡数及已确认代码指纹发生变化。
+    """默认要求完全相同；显式迁移需逐项核对卡数、实现与已授权协议差异。
 
     migration必须精确绑定来源与目标契约SHA。数据、算法配置、原始权重、处理器
     等其他字段始终严格相同，不能把迁移当作跳过校验的开关。显式online_execution_rebind
     仅接由原任务逐字段核验的新在线条件；任务ID/算法/源权重必须保持。
+    唯一协议迁移例外为GS-10共同成功及整组未知QA处理；其余优化/采样参数不变。
     """
     if source == target and migration is None:
         return
@@ -243,16 +248,43 @@ def validate_resume_contract(source, target, migration=None):
         "target_contract_sha256": contract_hash(target),
     }
     rebind = migration is not None and migration.get("online_execution_rebind") is True
+    protocol = migration is not None and migration.get("protocol_revision") == "gs-v1.1-unknown-qa-v1"
     if rebind:
         expected["online_execution_rebind"] = True
+    if protocol:
+        expected["protocol_revision"] = "gs-v1.1-unknown-qa-v1"
     if migration != expected:
         raise ValueError("恢复配置/数据或显式迁移批准不一致")
     excluded = {"world_size", "implementation_files"}
+    if protocol:
+        # 用户已确认的两项语义迁移，仅这两个配置键可变化；其余采样/优化/预算仍逐值比较。
+        old_config, new_config = dict(source["config"]), dict(target["config"])
+        if (
+            old_config.pop("unknown_qa_policy", "stop") not in {"stop", "retain_action_skip_qa_group"}
+            or new_config.pop("unknown_qa_policy", None) != "retain_action_skip_qa_group"
+            or old_config.pop("task_rule")
+            not in [
+                {"version": "libero-native-at-question-delivery-v1"},
+                {"version": "libero-shared-at-question-delivery-v1"},
+            ]
+            or new_config.pop("task_rule") != {"version": "libero-shared-at-question-delivery-v1"}
+            or old_config != new_config
+            or target.get("task_success_implementation", {}).get("version") != "libero-task-success-v1"
+            or not target["task_success_implementation"].get("files")
+        ):
+            raise ValueError("协议迁移只能启用共同成功判据与整组未知QA排除")
+        excluded.update({"config", "task_success_implementation"})
     if rebind:
         # train启动时已读取原任务表并逐字段核对只新增online_execution；此处绑定来源。
         proof = target.get("task_rebind", {})
+        prior = source.get("task_rebind", {})
+        same_origin = (
+            prior.get("source_tasks_sha256") == proof.get("source_tasks_sha256")
+            and prior.get("preserved_tasks_sha256") == proof.get("preserved_tasks_sha256")
+            and prior.get("target_tasks_sha256") == source["tasks_sha256"]
+        )
         if (
-            proof.get("source_tasks_sha256") != source["tasks_sha256"]
+            (proof.get("source_tasks_sha256") != source["tasks_sha256"] and not same_origin)
             or proof.get("target_tasks_sha256") != target["tasks_sha256"]
             or not proof.get("preserved_tasks_sha256")
         ):

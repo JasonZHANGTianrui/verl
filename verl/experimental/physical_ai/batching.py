@@ -38,8 +38,8 @@ def namespace_group(records, prefix):
 def task_groups(records):
     """返回每个完整任务的行号；每个动作组必须恰有一个QA组，不拆父经历。
 
-    同一batch允许多个case，但所有组须来自同一行为策略。组内奖励0/1和缺样本
-    沿validate_groups核验；相同case的重复采样也必须用不同group/rollout身份。
+    同一batch允许多个case，但所有组须来自同一行为策略。有效奖励0/1、整组未知QA
+    与缺样本沿validate_groups核验；相同case重复采样也必须用不同group/rollout身份。
     """
     groups = validate_groups(records)
     by_id = {r.rollout_id: r for r in records}
@@ -92,4 +92,8 @@ def prepare_batch(records, artifacts):
     if not bool(torch.isfinite(old).all()):
         raise ValueError("采样概率含非有限值")
     advantages, active, stats = segment_advantages(records, masks)
-    return dict(old=old, advantages=advantages, active=active, stats=stats)
+    # 真实采样mask与可训练mask分开：未知QA仍核验全部生成概率，loss则整组关闭。
+    sampled = torch.zeros_like(masks)
+    for i, record in enumerate(records):
+        sampled[i, record.start : record.end] = masks[i, record.start : record.end]
+    return dict(old=old, advantages=advantages, active=active, sampled=sampled, stats=stats)

@@ -56,6 +56,7 @@ def update_once(
     多mini-batch路径须先validate_behavior核验同版概率，再用enforce_on_policy=False；
     此后新旧策略差异属于正常策略更新，不能触发原同版一致性门槛。
     control_group是同成员Gloo组，仅承载CPU元数据/就绪同步；实际梯度仍走默认GPU组。
+    整组unknown QA按空loss跳过；阶段分母只计有效完整组，动作组不会因此丢弃。
     """
     from generate import no_cache_hidden
     from memory import checkpoint_linear_layers
@@ -80,13 +81,19 @@ def update_once(
     stats = dict(
         groups=len(phases),
         tasks=len(pairs),
-        zero_variance_groups=sum(len({r.reward for r in selected_records if r.group_id == g}) == 1 for g in phases),
+        zero_variance_groups=sum(
+            len({r.reward for r in selected_records if r.group_id == g and r.reward_status == "scored"}) == 1
+            for g in phases
+        ),
     )
     if not bool(advantages.any()):
         result = dict(status="skipped_zero_advantage", optimizer_step=False, **stats)
         save_json(Path(output) / "update.json", result)
         return result
-    phase_sizes = {phase: sum(r.phase == phase for r in selected_records) for phase in ["execution", "qa"]}
+    phase_sizes = {
+        phase: sum(r.phase == phase and r.reward_status == "scored" for r in selected_records)
+        for phase in ["execution", "qa"]
+    }
     config = OmegaConf.create(
         dict(
             clip_ratio=clip_ratio,
@@ -213,6 +220,7 @@ def validate_behavior(
 
     每rank检查自己的行，任何一行不匹配则所有rank拒绝更新。采用与采样一致的
     FP32完整前缀，保留原old log-prob，不能用重算值替换历史概率掩盖不一致。
+    sampled包含未知QA的真实输出，其不训练不等于可以跳过行为概率检查。
     """
     from generate import no_cache_hidden
     from runtime import to_device
@@ -232,7 +240,7 @@ def validate_behavior(
                 torch.load(artifact["inputs_path"], map_location="cpu", weights_only=True), torch.device("cuda")
             )
             n = inputs["input_ids"].shape[1] - 1
-            mask = prepared["active"][i : i + 1, :n].cuda()
+            mask = prepared.get("sampled", prepared["active"])[i : i + 1, :n].cuda()
             ids_mask = torch.cat((torch.zeros((1, 1), dtype=torch.bool, device="cuda"), mask), 1)
             hidden = no_cache_hidden(model, inputs)
             logp = next_token_logprobs(hidden, inputs["input_ids"], ids_mask, model.vlm.decode)

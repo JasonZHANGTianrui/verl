@@ -1,5 +1,10 @@
 # Physical AI 的 verl 接入
 
+2026-10-18后续：新配置使用GS-10共同成功monitor，并启用
+`unknown_qa_policy=retain_action_skip_qa_group`。旧冻结profile保留旧行为；以下历史
+“原生成功／任意unknown停止”的说明不覆盖本修订。标准入口为主仓
+`docs/specs/v0.1/sft-execution-standard.md`的GS-07/08/09/10。
+
 这是 `JasonZHANGTianrui/verl` fork 中的具身训练实现，包含 SegGRPO 分组、
 原生 G0.5 采样与概率计算、工具循环，以及单组／多卡更新诊断。
 已增加原生后端的连续训练与组边界恢复；完整 verl Ray/FSDP Trainer 仍待接入。
@@ -293,3 +298,26 @@ LiveChat实现SHA写入运行契约，不能只换权重而继续沿用不匹配
 v1新配置：动作每消息6144 token、最多60条消息，QA累计6144、最多2条消息和32控制步；
 动作物理预算为普通suite300、Long/90为520，生成超时120秒。动作奖励仍在QA交付前
 读取实际任务结果，task-ever仅诊断。GT用原Spec和本次历史，不做全量初态预演。
+
+### 未知QA组与共同动作奖励（2026-10-18）
+
+父轨迹均匀选择后，GT为undetermined时仍在原会话交付同题、采样完整8条QA，
+记录`reward=null/reward_status=unscored_unknown_gt`，不调用judge猜答案。动作8条
+正常计算优势；QA整组不参加优势/loss/准确率分母，不补零、不换题或父经历。
+invalid_data、not_supported、API和仿真错误仍拒绝，不能借未知例外隐去。
+
+batch128/mini32仍为真实采样槽位；`sampled`保留所有阶段生成token用于概率核验，
+`active`仅包含可评分token用于loss。有效阶段按完整有效组归一化，全部QA缺分时
+仅更新动作；SwanLab另报sampled/scored/unscored序列与组数，不能将未知画成0分。
+
+`libero-shared-at-question-delivery-v1`在动作阶段逐真实控制步使用公共
+`benchmark.adapters.libero_success.TaskSuccessMonitor`。交付QA前取共同成功，
+原生成功仅作诊断；首次状态、每步门槛、规则和实现身份保存到task-success.json。
+不以成功提前停、不补释放、不给在线模型额外追加SFT的100步收尾，QA后的动作
+不回填已取奖励。已登记抽屉规则撤掉附加释放门槛，其余到位/支撑/稳定条件保留。
+未登记修正规则的任务沿来源原规则，不能把抽屉阈值推广至全任务。
+
+恢复使用新输出和精确源/目标契约批准。`protocol_revision=gs-v1.1-unknown-qa-v1`
+仅允许以上两个配置变化及对应实现身份；lr/batch/n/预算/题义/模型仍须一致。
+在线源码重绑定可由同一原任务包派生，须核验双方preserved_tasks身份，不能跳过
+初态或问题检查。旧checkpoint保留原契约，新运行不伪称逐位复现旧奖励过程。

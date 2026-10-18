@@ -22,6 +22,7 @@ from ours.rl.tasks import load_initial, resolve_resource
 from .libero_session import LiberoSession
 
 EVALUATION_ACTION_RULE = "libero-native-at-question-delivery-v1"
+SHARED_ACTION_RULE = "libero-shared-at-question-delivery-v1"
 
 
 def needs_preparation_reference(online, *, seed, resolution):
@@ -53,7 +54,7 @@ def training_tasks(rows, rule):
     """
     from benchmark.libero.questions.registry import default_registry
 
-    if rule["version"] == EVALUATION_ACTION_RULE:
+    if rule["version"] in {EVALUATION_ACTION_RULE, SHARED_ACTION_RULE}:
         selected = list(rows)
         supported = {"libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"}
         if any(r["split"] != "train" or r["environment"]["suite"] not in supported for r in selected):
@@ -75,6 +76,19 @@ def task_reward_at_delivery(task, rule, session, reader, recorder, termination):
     指令不执行，按实际环境结果计分并照常续问；环境/接口异常不能变成零分。QA不反改此分。
     这是显式的测评兼容版本，不冒充尚未统一接入的自定义任务判据。
     """
+    if rule["version"] == SHARED_ACTION_RULE:
+        monitor = session.success_monitor
+        row = monitor.observe(session.steps)
+        return dict(
+            task_reward=float(row["success"]),
+            native_success=row["native_success"],
+            success_details=row["details"],
+            success_contract=monitor.contract,
+            model_output_valid=termination not in {"model_tool_error", "model_action_decode_error"},
+            rule=rule,
+            step=session.steps,
+            action_metric="shared_at_question_delivery",
+        )
     if rule["version"] != EVALUATION_ACTION_RULE:
         return state_task_reward(task, rule, reader, recorder)
     from benchmark.adapters.libero_execution import task_success

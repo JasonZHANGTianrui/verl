@@ -27,6 +27,23 @@ from benchmark.scoring.llm_judge import judge_answer
 from ours.sft.shared.io import write as save_json  # noqa: F401
 
 
+def qa_reward_status(binding, policy="stop"):
+    """按已固定策略区分可评分与整组未知；数据错误/未支持不伪装成可忽略未知。
+
+    只看交付GT，不读模型答案。返回Segment采用的状态；无效策略或其他GT错误
+    仍拒绝。retain_action_skip_qa_group只关闭QA奖励和直接loss，不改变动作组。
+    """
+    if policy not in {"stop", "retain_action_skip_qa_group"}:
+        raise ValueError("未知QA组处理策略")
+    if binding["gt"]["status"] == "ok":
+        return "scored"
+    if binding["gt"]["status"] == "undetermined" and policy == "retain_action_skip_qa_group":
+        from .seggrpo import UNSCORED_QA
+
+        return UNSCORED_QA
+    raise ValueError("选定父经历GT不可评分，禁止重选父轨迹或填零：" + str(binding["gt"].get("reason")))
+
+
 def bind_delivery(question, recorder, names, rollout_id):
     """在真实追问交付处冻结GT与来源身份；后续分支动作不得改写该绑定。
 

@@ -68,6 +68,49 @@ class _UncopyableSim:
 class OnlineRewardTests(unittest.TestCase):
     """GT来源、裁判错误和物理副本的核心隔离检查。"""
 
+    def test_shared_action_reward_uses_monitor_instead_of_native_success(self):
+        """GS-10共同判据不满足时，即使原生成功也不能给RL动作1分。"""
+        from verl.experimental.physical_ai.task_data import SHARED_ACTION_RULE, task_reward_at_delivery
+
+        called = []
+        monitor = SimpleNamespace(
+            contract={"version": "libero-task-success-v1"},
+            observe=lambda step: called.append(step)
+            or dict(success=False, native_success=True, details={"stable": False}),
+        )
+        session = SimpleNamespace(success_monitor=monitor, steps=42)
+        value = task_reward_at_delivery({}, {"version": SHARED_ACTION_RULE}, session, None, None, "model_text_end")
+        self.assertEqual(value["task_reward"], 0)
+        self.assertTrue(value["native_success"])
+        self.assertEqual(called, [42])
+
+    def test_unknown_qa_retains_response_without_calling_judge(self):
+        """仅明确undetermined允许整组排除，原始回答仍留存且null不变成0。"""
+        from verl.experimental.physical_ai.online_reward import qa_reward_status
+        from verl.experimental.physical_ai.seggrpo import UNSCORED_QA
+
+        value = binding()
+        value["gt"].update(status="undetermined", value=None, reference_answer=None, reason="uncertain_grasp")
+        value["binding_sha256"] = hashlib.sha256(
+            canonical({k: v for k, v in value.items() if k != "binding_sha256"}).encode()
+        ).hexdigest()
+        self.assertEqual(qa_reward_status(value, "retain_action_skip_qa_group"), UNSCORED_QA)
+
+        def forbidden(messages):
+            """未知GT不得发往API猜答案。"""
+            raise AssertionError("must not call judge")
+
+        scored = score_answer(value, "I grasped the mug first.", forbidden, rollout_id="parent-a")
+        self.assertEqual(scored["status"], "excluded_gt")
+        self.assertIsNone(scored["score"])
+        self.assertEqual(scored["attempts"], [])
+        with self.assertRaises(ValueError):
+            qa_reward_status(value)
+        for status in ["invalid_data", "not_supported"]:
+            value["gt"]["status"] = status
+            with self.assertRaises(ValueError):
+                qa_reward_status(value, "retain_action_skip_qa_group")
+
     def test_runtime_preparation_contract_is_explicit(self):
         """取消逐样本预演不取消版本/seed/分辨率校验，旧回执模式继续严格读取。"""
         from verl.experimental.physical_ai.task_data import needs_preparation_reference

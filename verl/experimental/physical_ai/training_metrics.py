@@ -11,50 +11,67 @@ import torch
 
 
 def rollout_metrics(records, artifacts, prepared):
-    """统计整个采样batch，而非只看有非零梯度的样本。
+    """分开统计真实采样与有效奖励；unknown整组不计为失败/零方差组。
 
-    返回SwanLab可直接接收的数值字典。长度单位为token；优势按响应取一次，避免长
-    序列被多计。old_sampled_nll是采样token的负log-prob，不冒充完整词表精确熵。
-    全同分组仍计入奖励分布及零方差比例；不把它们过滤掉使曲线显得更好。
+    长度和耗时覆盖全部实际采样。奖励、优势及准确率仅统计scored完整组；该阶段
+    全部未知时不输出伪造的0准确率，明确输出scored_sequences=0和排除组数。
     """
     metrics = {}
     for phase in ("execution", "qa"):
-        ids = [i for i, r in enumerate(records) if r.phase == phase]
+        all_ids = [i for i, r in enumerate(records) if r.phase == phase]
+        ids = [i for i in all_ids if records[i].reward_status == "scored"]
         prefix = f"rollout/{phase}"
-        rewards = torch.tensor([records[i].reward for i in ids], dtype=torch.float32)
-        groups = defaultdict(list)
-        lengths, contexts, advantages, nll = [], [], [], []
-        for i in ids:
-            groups[records[i].group_id].append(records[i].reward)
-            mask = prepared["active"][i]
-            lengths.append(int(mask.sum()))
-            contexts.append(len(artifacts[i]["generated"]))
-            advantages.append(float(prepared["advantages"][i][mask][0]))
-            nll.append(float(-prepared["old"][i][mask].mean()))
-        mixed = sum(len(set(values)) > 1 for values in groups.values())
         metrics.update(
             {
-                f"{prefix}/reward_mean": float(rewards.mean()),
-                f"{prefix}/reward_std": float(rewards.std(unbiased=False)),
-                f"{prefix}/zero_variance_group_fraction": 1 - mixed / len(groups),
-                f"{prefix}/effective_groups": mixed,
-                f"{prefix}/all_success_group_fraction": sum(all(v == 1 for v in g) for g in groups.values())
-                / len(groups),
-                f"{prefix}/all_failure_group_fraction": sum(all(v == 0 for v in g) for g in groups.values())
-                / len(groups),
+                f"{prefix}/sampled_sequences": len(all_ids),
+                f"{prefix}/scored_sequences": len(ids),
+                f"{prefix}/unscored_sequences": len(all_ids) - len(ids),
+                f"{prefix}/unscored_groups": len({records[i].group_id for i in all_ids if i not in ids}),
+            }
+        )
+        if not all_ids:
+            continue
+        sampled = prepared.get("sampled", prepared["active"])
+        lengths = [int(sampled[i].sum()) for i in all_ids]
+        contexts = [len(artifacts[i]["generated"]) for i in all_ids]
+        metrics.update(
+            {
                 f"{prefix}/phase_tokens_mean": sum(lengths) / len(lengths),
                 f"{prefix}/phase_tokens_max": max(lengths),
                 f"{prefix}/context_tokens_mean": sum(contexts) / len(contexts),
                 f"{prefix}/context_tokens_max": max(contexts),
-                f"{prefix}/old_sampled_nll": sum(nll) / len(nll),
-                f"{prefix}/advantage_mean": sum(advantages) / len(advantages),
-                f"{prefix}/advantage_abs_mean": sum(abs(a) for a in advantages) / len(advantages),
-                f"{prefix}/advantage_min": min(advantages),
-                f"{prefix}/advantage_max": max(advantages),
+                f"{prefix}/old_sampled_nll": sum(float(-prepared["old"][i][sampled[i]].mean()) for i in all_ids)
+                / len(all_ids),
             }
         )
+        if ids:
+            rewards = torch.tensor([records[i].reward for i in ids], dtype=torch.float32)
+            groups = defaultdict(list)
+            advantages = []
+            for i in ids:
+                groups[records[i].group_id].append(records[i].reward)
+                advantages.append(float(prepared["advantages"][i][prepared["active"][i]][0]))
+            mixed = sum(len(set(values)) > 1 for values in groups.values())
+            metrics.update(
+                {
+                    f"{prefix}/reward_mean": float(rewards.mean()),
+                    f"{prefix}/reward_std": float(rewards.std(unbiased=False)),
+                    f"{prefix}/zero_variance_group_fraction": 1 - mixed / len(groups),
+                    f"{prefix}/effective_groups": mixed,
+                    f"{prefix}/all_success_group_fraction": sum(all(v == 1 for v in g) for g in groups.values())
+                    / len(groups),
+                    f"{prefix}/all_failure_group_fraction": sum(all(v == 0 for v in g) for g in groups.values())
+                    / len(groups),
+                    f"{prefix}/advantage_mean": sum(advantages) / len(advantages),
+                    f"{prefix}/advantage_abs_mean": sum(abs(a) for a in advantages) / len(advantages),
+                    f"{prefix}/advantage_min": min(advantages),
+                    f"{prefix}/advantage_max": max(advantages),
+                }
+            )
+        else:
+            metrics[f"{prefix}/effective_groups"] = 0
         for key in ("environment_step_seconds", "scene_capture_seconds", "video_append_seconds"):
-            values = [artifacts[i].get("timings", {}).get(key) for i in ids]
+            values = [artifacts[i].get("timings", {}).get(key) for i in all_ids]
             if all(v is not None for v in values):
                 metrics[f"timing/{phase}/{key}_mean"] = sum(values) / len(values)
                 metrics[f"timing/{phase}/{key}_max"] = max(values)
@@ -76,8 +93,11 @@ def update_metrics(result, records, indices):
     metrics["actor/policy_loss"] = sum(r["loss"] for r in rows)
     for phase in ("execution", "qa"):
         phase_rows = [r for r in rows if r["phase"] == phase]
-        count = sum(records[i].phase == phase for i in indices)
+        count = sum(records[i].phase == phase and records[i].reward_status == "scored" for i in indices)
         prefix = f"actor/{phase}"
+        metrics[f"{prefix}/scored_sequences"] = count
+        if not count:
+            continue
         metrics[f"{prefix}/policy_loss"] = sum(r["policy_loss"] for r in phase_rows) / count
         metrics[f"{prefix}/active_sequence_fraction"] = len(phase_rows) / count
         for key in (

@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+UNSCORED_QA = "unscored_unknown_gt"
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -31,7 +33,8 @@ class Segment:
 
     condition_id绑定同一case/初态；QA时还须绑定父轨迹完整前缀、问题和交付GT。
     start/end是对齐log_probs与generated_mask列的半开区间，不是环境步或字符位置。
-    group_size是采样前声明的完整组大小；reward_status只有scored允许进入更新。
+    group_size是采样前声明的完整组大小；仅scored进入更新。整组QA可显式为
+    unscored_unknown_gt且reward=None，保留真实采样但不参与奖励统计/梯度。
     """
 
     rollout_id: str
@@ -49,10 +52,11 @@ class Segment:
 
 
 def validate_groups(records):
-    """拒绝缺分/缺样本、混条件/策略/阶段、重复响应及未绑定父轨迹的组。
+    """拒绝缺样本、混条件/策略/阶段、重复响应及未绑定父轨迹的组。
 
     返回group_id到行号列表。调用前须收齐整个训练组；不对单个micro-batch重算优势，
     不将基础设施错误填0。条件内容的hash核验由采集层负责，本函数检查已绑定身份。
+    仅允许完整QA组显式unknown且全组reward=None；混合scored/unknown仍拒绝。
     """
     if not records:
         raise ValueError("空训练批次")
@@ -73,9 +77,12 @@ def validate_groups(records):
             raise ValueError("GRPO完整组至少两条，不能退化成单样本")
         if type(record.start) is not int or type(record.end) is not int or not 0 <= record.start < record.end:
             raise ValueError("阶段token边界无效")
-        if record.reward_status != "scored" or record.reward is None or not math.isfinite(record.reward):
+        excluded_qa = record.phase == "qa" and record.reward_status == UNSCORED_QA and record.reward is None
+        if not excluded_qa and (
+            record.reward_status != "scored" or record.reward is None or not math.isfinite(record.reward)
+        ):
             raise ValueError("缺少有效奖励，保留组等待重试，不自动记零")
-        if record.reward not in (0, 1):
+        if not excluded_qa and record.reward not in (0, 1):
             raise ValueError("当前动作/QA契约只接受0或1")
         groups[record.group_id].append(index)
     if len({r.policy_version for r in records}) != 1:
@@ -91,6 +98,7 @@ def validate_groups(records):
                 records[i].case_id,
                 records[i].group_size,
                 records[i].parent_rollout_id,
+                records[i].reward_status,
             )
             for i in indices
         }
@@ -138,6 +146,7 @@ def segment_advantages(records, generated_mask):
     generated_mask为[N,T]布尔值，包含原生模型生成位置；QA行的父历史即使原先也是
     模型生成token，也因不在本阶段区间而被排除。工具/图像/state始终不能计策略loss。
     奖励放到本阶段最后一个真实生成位置；全同奖励组优势为0，不伪造差异。
+    显式未知QA不送入GRPO，返回其全零优势/loss mask，原奖励记录仍为None。
     """
     from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 
@@ -153,16 +162,33 @@ def segment_advantages(records, generated_mask):
         positions = mask[i].nonzero(as_tuple=False).flatten()
         if not len(positions):
             raise ValueError("阶段没有真实生成token，不能制造EOS或奖励位置")
-        rewards[i, positions[-1]] = record.reward
-    advantages, _ = compute_grpo_outcome_advantage(
-        rewards,
-        mask.float(),
-        np.array([r.group_id for r in records]),
-        epsilon=1e-6,
-        norm_adv_by_std_in_grpo=True,
+        if record.reward_status == "scored":
+            rewards[i, positions[-1]] = record.reward
+        else:
+            mask[i].zero_()
+    # null奖励绝不送入GRPO，也不填成0参与组内/组间归一化。未评分行只保留零梯度槽位。
+    scored = [i for i, r in enumerate(records) if r.reward_status == "scored"]
+    advantages = torch.zeros_like(rewards)
+    if scored:
+        values, _ = compute_grpo_outcome_advantage(
+            rewards[scored],
+            mask[scored].float(),
+            np.array([records[i].group_id for i in scored]),
+            epsilon=1e-6,
+            norm_adv_by_std_in_grpo=True,
+        )
+        advantages[scored] = values
+    valid_groups = [ids for ids in groups.values() if records[ids[0]].reward_status == "scored"]
+    zero_groups = sum(len({records[i].reward for i in ids}) == 1 for ids in valid_groups)
+    return (
+        advantages,
+        mask,
+        dict(
+            groups=len(valid_groups),
+            zero_variance_groups=zero_groups,
+            unscored_qa_groups=len(groups) - len(valid_groups),
+        ),
     )
-    zero_groups = sum(len({records[i].reward for i in ids}) == 1 for ids in groups.values())
-    return advantages, mask, dict(groups=len(groups), zero_variance_groups=zero_groups)
 
 
 def segmented_policy_loss(
@@ -197,6 +223,8 @@ def segmented_policy_loss(
     by_phase = defaultdict(list)
     phase_metrics = defaultdict(list)
     for indices in groups.values():
+        if records[indices[0]].reward_status == UNSCORED_QA:
+            continue
         value, metrics = compute_policy_loss_vanilla(
             old_logprobs[indices].detach(),
             logprobs[indices],
@@ -211,6 +239,8 @@ def segmented_policy_loss(
     total = logprobs.sum() * 0.0
     for phase, weight in [("execution", execution_weight), ("qa", qa_weight)]:
         if phase not in by_phase:
+            if phase == "qa" and any(r.phase == "qa" and r.reward_status == UNSCORED_QA for r in records):
+                continue
             if weight:
                 raise ValueError("缺少启用阶段的完整训练组")
             continue

@@ -127,6 +127,47 @@ def _reshard_adam_worker(rank, directory):
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
 
+    def test_explicit_unknown_qa_and_shared_reward_migration_is_narrow(self):
+        """批准GS迁移也不能夹带学习率/batch/数据变化；来源和目标契约必须精确绑定。"""
+        from copy import deepcopy
+
+        source = dict(
+            world_size=8,
+            tasks_sha256="tasks",
+            implementation_files={"pilot": "old"},
+            config=dict(
+                batch_size=128, learning_rate=1e-6, task_rule={"version": "libero-native-at-question-delivery-v1"}
+            ),
+        )
+        target = deepcopy(source)
+        target["implementation_files"]["pilot"] = "new"
+        target["config"].update(
+            unknown_qa_policy="retain_action_skip_qa_group",
+            task_rule={"version": "libero-shared-at-question-delivery-v1"},
+        )
+        target["task_success_implementation"] = dict(version="libero-task-success-v1", files={"registry": "hash"})
+
+        def approval(dst):
+            """显式批准两个精确内容身份，不能只给宽泛allow标志。"""
+            return dict(
+                source_contract_sha256=contract_hash(source),
+                target_contract_sha256=contract_hash(dst),
+                protocol_revision="gs-v1.1-unknown-qa-v1",
+            )
+
+        validate_resume_contract(source, target, approval(target))
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, target)
+        for key, value in [("batch_size", 64), ("learning_rate", 1e-4), ("unknown_qa_policy", "fill_zero")]:
+            bad = deepcopy(target)
+            bad["config"][key] = value
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, bad, approval(bad))
+        bad = deepcopy(target)
+        bad["tasks_sha256"] = "other"
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval(bad))
+
     def test_sampling_axis_keeps_update_count_and_spikes(self):
         """每采样批仅一个日志点，更新累计数和逐mini尖峰不能被平均抹掉。"""
         from verl.experimental.physical_ai.training_metrics import sampling_batch_metrics
@@ -181,6 +222,24 @@ class TrainingStateTests(unittest.TestCase):
             validate_resume_contract(source, target, approval)
         approval["online_execution_rebind"] = True
         validate_resume_contract(source, target, approval)
+        # 两次执行绑定可以共享同一个原始任务包，但必须保存完全相同的题目/初态投影。
+        rebound = dict(
+            target,
+            tasks_sha256="third",
+            task_rebind=dict(
+                source_tasks_sha256="source", target_tasks_sha256="third", preserved_tasks_sha256="same-tasks"
+            ),
+        )
+        chained = dict(
+            source_contract_sha256=contract_hash(target),
+            target_contract_sha256=contract_hash(rebound),
+            online_execution_rebind=True,
+        )
+        validate_resume_contract(target, rebound, chained)
+        rebound["task_rebind"]["preserved_tasks_sha256"] = "changed"
+        chained["target_contract_sha256"] = contract_hash(rebound)
+        with self.assertRaises(ValueError):
+            validate_resume_contract(target, rebound, chained)
         target["eligible_ids"] = ["other"]
         approval["target_contract_sha256"] = contract_hash(target)
         with self.assertRaises(ValueError):

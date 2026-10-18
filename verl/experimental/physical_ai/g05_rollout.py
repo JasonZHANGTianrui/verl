@@ -194,6 +194,10 @@ def phase_steps(
                 session.steps += 1
                 session.last_action = action.copy()
                 session.action_history.append(dict(step=session.steps, mode=mode, action=action.tolist()))
+                # GS-10：共同任务判据每真实控制步读取；只记私有状态，不提前停或补动作。
+                monitor = getattr(session, "success_monitor", None)
+                if monitor is not None:
+                    monitor.observe(session.steps)
                 started = time.perf_counter()
                 if scene_capture is not None:
                     scene_capture.observe(session.steps)

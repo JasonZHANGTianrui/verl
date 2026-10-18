@@ -48,10 +48,16 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     from .batched_sampling import run_phases
     from .g05_rollout import chat_fingerprint, phase_steps
     from .libero_session import LiberoSession
-    from .online_reward import bind_delivery, save_json, score_answer
+    from .online_reward import bind_delivery, qa_reward_status, save_json, score_answer
     from .sampling import fork_chat, sample_response
     from .seggrpo import Segment, select_parent
-    from .task_data import EVALUATION_ACTION_RULE, create_scene_capture, open_task_session, task_reward_at_delivery
+    from .task_data import (
+        EVALUATION_ACTION_RULE,
+        SHARED_ACTION_RULE,
+        create_scene_capture,
+        open_task_session,
+        task_reward_at_delivery,
+    )
 
     question = config["question"]
     if type(config.get("thinking", False)) is not bool:
@@ -106,7 +112,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             )
             reader = capture.reader if capture is not None else LiberoSceneMap(session.env)
             if (
-                config["task_rule"]["version"] != EVALUATION_ACTION_RULE
+                config["task_rule"]["version"] not in {EVALUATION_ACTION_RULE, SHARED_ACTION_RULE}
                 and config["task_rule"]["calibration"] != reader.config["version"]
             ):
                 raise ValueError("任务状态规则与实际Scene map版本不同")
@@ -119,6 +125,12 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 recorder.observe(reader.read(0))
             if task is None and question["parameters"]["query"]["entity"] not in reader.nodes:
                 raise ValueError("题目实体未绑定到真实场景")
+            if config["task_rule"]["version"] == SHARED_ACTION_RULE:
+                from benchmark.adapters.libero_success import TaskSuccessMonitor
+
+                session.success_monitor = TaskSuccessMonitor(session.env, family="libero")
+                session.success_monitor.observe(0)
+                save_json(output / "scene" / rollout_id / "success-contract.json", session.success_monitor.contract)
             condition = hashlib.sha256(session.env.sim.get_state().flatten().tobytes()).hexdigest()
             # 初态在真实rollout现场核验：同组分支比较完整准备/控制状态，不需逐样本离线预演。
             from copy import deepcopy
@@ -188,6 +200,14 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 "scored",
             )
             phase["inputs_path"] = str(directory / "inputs.pt")
+            if config["task_rule"]["version"] == SHARED_ACTION_RULE:
+                save_json(
+                    directory / "task-success.json",
+                    dict(
+                        contract=session.success_monitor.contract,
+                        rows=session.success_monitor.rows,
+                    ),
+                )
             save_json(
                 directory / "reward.json",
                 {**task_result, "binding": binding, "native_success": session.audit()["native_success"]},
@@ -208,8 +228,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         selected = select_parent(records, seed=config["seed"], mode="uniform")
         parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
         session, chat, phase, binding = parents[parent_index]
-        if binding["gt"]["status"] != "ok":
-            raise ValueError("选定父经历GT未知，保留原组，不能重选父轨迹或填零")
+        reward_status = qa_reward_status(binding, config.get("unknown_qa_policy", "stop"))
         # 未选中的真实轨迹/GT已经落盘，之后不再执行这些环境；及时释放其EGL资源。
         # 只关闭环境，不删除原会话/动作记录，也不按奖励改变父轨迹选择。
         for index, parent in enumerate(parents):
@@ -235,6 +254,9 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 seed=config["seed"],
                 prefix_sha256=prefix_hash,
                 condition_id=qa_condition,
+                qa_reward_status=reward_status,
+                gt_status=binding["gt"]["status"],
+                gt_reason=binding["gt"].get("reason"),
             ),
         )
         client = JudgeClient(
@@ -267,8 +289,10 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 )
                 judgment = score_answer(binding, answer["answer"], client, rollout_id=selected)
                 save_json(directory / "judge.json", judgment)
-                if judgment["status"] != "scored":
+                if reward_status == "scored" and judgment["status"] != "scored":
                     raise ValueError("judge未给有效分数，整个组保留待恢复，禁止更新")
+                if reward_status != "scored" and (judgment["status"] != "excluded_gt" or judgment["score"] is not None):
+                    raise ValueError("未知GT的QA不得调用裁判或产生分数")
                 record = Segment(
                     child_id,
                     "qa",
@@ -279,8 +303,8 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     config["qa_group_size"],
                     answer["prefix_length"] - 1,
                     answer["end_length"] - 1,
-                    float(judgment["score"]),
-                    "scored",
+                    float(judgment["score"]) if reward_status == "scored" else None,
+                    reward_status,
                     parent_rollout_id=selected,
                 )
                 answer["inputs_path"] = str(directory / "inputs.pt")
