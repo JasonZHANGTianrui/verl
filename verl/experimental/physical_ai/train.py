@@ -219,6 +219,15 @@ def main():
                     )
                 },
             )
+        # 新入口显式绑定起点选择。所有题共享同一实验策略，不能逐题切换等待以挑成绩。
+        waits = [r.get("online_execution", {}).get("wait_for_stability") for r in eligible]
+        if any(type(value) is not bool for value in waits) or len(set(waits)) != 1:
+            raise ValueError("任务发布必须具有统一、显式的wait_for_stability策略")
+        from benchmark.adapters.libero_observation import VERSION as refresh_version
+
+        contract["execution_boundary"] = dict(
+            version="rl-source-start-and-fork-v1", wait_for_stability=waits[0], refresh=refresh_version
+        )
         from ours.rl.prepare_online import validate_rebind
 
         task_rebind = validate_rebind(args.task_release, rows)

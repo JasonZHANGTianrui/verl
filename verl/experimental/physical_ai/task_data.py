@@ -93,7 +93,13 @@ def task_reward_at_delivery(task, rule, session, reader, recorder, termination):
         return state_task_reward(task, rule, reader, recorder)
     from benchmark.adapters.libero_execution import task_success
 
-    if task["environment"]["suite"] not in {"libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"}:
+    if task["environment"]["suite"] not in {
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+        "libero_10",
+        "libero_90",
+    }:
         raise ValueError("此奖励版本未支持非普通LIBERO来源")
     native = bool(task_success(session.env))
     valid_output = termination not in {"model_tool_error", "model_action_decode_error"}
@@ -168,6 +174,9 @@ def open_task_session(task, resources, *, seed, max_steps, resolution=256):
     indices = [i for i in range(suite.n_tasks) if suite.get_task(i).name == initial.task_name]
     if len(indices) != 1:
         raise ValueError("训练任务未唯一绑定官方suite")
+    online = task.get("online_execution")
+    if not online or type(online.get("wait_for_stability")) is not bool:
+        raise ValueError("新RL入口要求显式初始化选择；旧任务包须重新绑定，不能推测等待策略")
     session = LiberoSession(
         suite_name,
         indices[0],
@@ -175,6 +184,7 @@ def open_task_session(task, resources, *, seed, max_steps, resolution=256):
         max_steps=max_steps,
         resolution=resolution,
         initial_condition=initial,
+        wait_for_stability=online["wait_for_stability"],
     )
     expected = task.get("online_execution", {}).get(
         "initialization_version", task["environment"]["initialization_version"]
@@ -219,7 +229,9 @@ def create_scene_capture(session, task, resources, output, *, rollout_id):
         raise ValueError("需要真实rollout身份")
     online = task.get("online_execution", {})
     expected = json.loads(
-        resolve_resource(online.get("scene_config_ref", task["environment"]["scene_config_ref"]), resources).read_text()
+        resolve_resource(
+            online.get("scene_config_ref", task["environment"]["scene_config_ref"]), resources
+        ).read_text()
     )
     initial = session.settings["initial_condition"]
     capture = SceneCapture(

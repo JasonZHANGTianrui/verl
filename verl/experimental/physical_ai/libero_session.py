@@ -133,6 +133,61 @@ def copy_visual_runtime(parent, child):
     return dict(rule="libero-registered-visual-state-v1", sites=records)
 
 
+def snapshot_observables(base):
+    """保存LIBERO传感器采样状态与依赖缓存，不复制绑定环境的函数。
+
+    base是底层环境。时间字段单位秒，读数保持原生形状/类型；仅支持已验证的
+    无噪声、无滤波、无延迟Observable。把静态配置与动态状态分开保存，恢复时
+    检查同构配置；将来上游增加内部字段须先审核，不能悄悄漏掉新的动态状态。
+    """
+    from robosuite.utils.observables import NO_CORRUPTION, NO_DELAY, NO_FILTER
+
+    fixed = ("name", "_sampling_timestep", "_enabled", "_active", "_is_number", "_data_shape")
+    mutable = ("_time_since_last_sample", "_current_delay", "_current_observed_value", "_sampled")
+    functions = ("_sensor", "_corrupter", "_filter", "_delayer")
+    rows = {}
+    for name, observable in base._observables.items():
+        if set(vars(observable)) != set(fixed + mutable + functions):
+            raise ValueError("未审核的Observable内部结构：" + name)
+        if (
+            observable._corrupter is not NO_CORRUPTION
+            or observable._filter is not NO_FILTER
+            or observable._delayer is not NO_DELAY
+        ):
+            raise ValueError("分叉不支持有状态或随机传感器：" + name)
+        if (
+            not np.isfinite(observable._time_since_last_sample)
+            or not np.isfinite(observable._sampling_timestep)
+            or observable._sampling_timestep <= 0
+            or observable._current_delay != 0
+        ):
+            raise ValueError("非法传感器时钟/延迟：" + name)
+        rows[name] = dict(
+            config={k: getattr(observable, k) for k in fixed}, state={k: getattr(observable, k) for k in mutable}
+        )
+    # 一次deepcopy保留同一环境内部cache/读数的共享关系，父子之间则不共享可写数组。
+    return deepcopy(dict(observables=rows, cache=base._obs_cache))
+
+
+def restore_observables(base, snapshot):
+    """向同构子环境恢复采样相位/读数；不调用sensor，不推进时间，不改传感器闭包。
+
+    也用于撤销分叉核验的缓存刷新。先完整校验所有配置再修改，未知字段及顺序差异
+    报错；观察依赖按登记顺序读取，不能只比较名称集合。
+    """
+    current = snapshot_observables(base)
+    if list(current["observables"]) != list(snapshot["observables"]):
+        raise ValueError("分叉传感器登记/顺序不一致")
+    for name, row in current["observables"].items():
+        if row["config"] != snapshot["observables"][name]["config"]:
+            raise ValueError("分叉传感器配置不一致：" + name)
+    copied = deepcopy(snapshot)
+    for name, row in copied["observables"].items():
+        for field, value in row["state"].items():
+            setattr(base._observables[name], field, value)
+    base._obs_cache = copied["cache"]
+
+
 class LiberoSession:
     """一条rollout拥有一个环境，多次动作调用共享同一物理状态。
 
@@ -152,13 +207,17 @@ class LiberoSession:
         resolution: int = 256,
         physics_patch: str | None = None,
         initial_condition=None,
+        wait_for_stability: bool = False,
     ):
-        """构造、reset并稳定初态；预算按20Hz控制步计，不含初始化等待。
+        """构造并恢复源初态；预算按20Hz控制步计，不含显式启用的初始化等待。
 
-        初始状态从官方suite读取。使用本项目统一光照、隐藏辅助site和场景稳定入口。
+        初始状态从官方suite读取。使用统一光照及隐藏辅助site；默认不等待、不重设
+        控制目标。wait_for_stability=True仅作显式v5对照，选择随分叉继承。
         initial_condition显式提供时从训练示范XML/states[0]恢复，不索引官方测试初态。
         初始化失败会关闭已创建环境并抛异常，不能当成模型任务失败。
         """
+        if type(wait_for_stability) is not bool:
+            raise ValueError("wait_for_stability必须是显式布尔值")
         if type(max_steps) is not int or max_steps <= 0:
             raise ValueError("max_steps必须为正整数控制步")
         if type(initial_state_index) is not int or initial_state_index < 0:
@@ -174,6 +233,7 @@ class LiberoSession:
             resolution=resolution,
             physics_patch=physics_patch,
             initial_condition=initial_condition,
+            wait_for_stability=wait_for_stability,
         )
         self.owner = (os.getpid(), threading.get_ident())
         self.env = None
@@ -188,16 +248,20 @@ class LiberoSession:
 
                 if physics_patch is not None:
                     raise ValueError("训练示范初态不能叠加未声明物理补丁")
-                self.env, task, _, self.observation = open_environment(initial_condition, suite, resolution, seed=seed)
+                self.env, task, _, self.observation = open_environment(
+                    initial_condition, suite, resolution, seed=seed, wait_for_stability=wait_for_stability
+                )
             else:
-                self.env, task, states = make_env(suite, task_index, resolution, physics_patch=physics_patch)
+                self.env, task, states = make_env(
+                    suite, task_index, resolution, physics_patch=physics_patch, wait_for_stability=wait_for_stability
+                )
                 self.env.seed(seed)
                 self.env.reset()
                 if initial_state_index >= len(states):
                     raise IndexError("初始状态索引越界")
                 self.observation = self.env.set_init_state(states[initial_state_index])
             self.task = task.language
-            # 统一set_init_state已经刷新控制器和首观察，回执即本次任务第0步。
+            # 统一set_init_state按显式策略准备首观察；false不更新控制目标，回执即第0步。
             self.preparation = deepcopy(self.env.preparation)
             bind_render_context(self.env.env.sim)
             from OpenGL import GL
@@ -316,8 +380,20 @@ class LiberoSession:
             # env.step返回的是传感器采样缓存，可能略早于最后一个物理子步。
             # 分叉不向模型新增观察；用即时渲染验证复制，再保留父回合实际交付的旧观察。
             cached_observation = deepcopy(self.observation)
-            parent_current = self.env.env._get_observations(force_update=True)
-            child_current = child.env.env._get_observations(force_update=True)
+            # 先复制完整采样状态。核验用刷新不推进时钟，且还原读数缓存，避免影响
+            # 后续未到采样点的传感器；传感器闭包仍分别绑定自己的环境。
+            sensor_state = snapshot_observables(self.env.env)
+            restore_observables(child.env.env, sensor_state)
+            from benchmark.adapters.libero_observation import refresh_observation
+
+            try:
+                parent_current = deepcopy(refresh_observation(self.env))
+                child_current = deepcopy(refresh_observation(child.env))
+            finally:
+                restore_observables(self.env.env, sensor_state)
+                restore_observables(child.env.env, sensor_state)
+            if getattr(self, "success_monitor", None) is not None:
+                child.success_monitor = self.success_monitor.fork(child.env)
             child.observation = cached_observation
             if not np.array_equal(
                 self.env.env.sim.get_state().flatten(),
@@ -341,6 +417,8 @@ class LiberoSession:
                     raise ValueError("分支渲染变换与父轨迹不同：" + name)
             child.fork_validation = dict(
                 visual_runtime=visual_runtime,
+                sensor_state="phase-and-cache-preserved-v1",
+                success_history_copied=getattr(child, "success_monitor", None) is not None,
                 physical_state_equal=True,
                 render_transforms_equal=True,
                 initial_observation="exact_parent_copy",

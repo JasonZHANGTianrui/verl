@@ -168,6 +168,54 @@ class TrainingStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_resume_contract(source, bad, approval(bad))
 
+    def test_source_start_migration_does_not_change_reward_or_training(self):
+        """初态/分叉迁移须保持题目和优化配置，不能顺便改成功登记或将等待重新打开。"""
+        from copy import deepcopy
+
+        source = dict(
+            world_size=8,
+            config={"batch_size": 128},
+            tasks_sha256="old",
+            task_success_implementation={
+                "version": "libero-task-success-v1",
+                "files": {"task-success-v1.json": "registry", "monitor": "old"},
+            },
+        )
+        target = deepcopy(source)
+        target.update(
+            tasks_sha256="new",
+            task_rebind={"source_tasks_sha256": "old", "target_tasks_sha256": "new", "preserved_tasks_sha256": "same"},
+            execution_boundary={
+                "version": "rl-source-start-and-fork-v1",
+                "wait_for_stability": False,
+                "refresh": "libero-refresh-preserve-sampling-v1",
+            },
+        )
+        target["task_success_implementation"]["files"]["monitor"] = "new"
+
+        def approval(dst):
+            """精确绑定来源和候选契约，供允许/拒绝的反例共享。"""
+            return dict(
+                source_contract_sha256=contract_hash(source),
+                target_contract_sha256=contract_hash(dst),
+                protocol_revision="gs-v1.1-source-start-v1",
+                online_execution_rebind=True,
+            )
+
+        validate_resume_contract(source, target, approval(target))
+        bad = deepcopy(target)
+        bad["config"]["learning_rate"] = 1e-4
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval(bad))
+        bad = deepcopy(target)
+        bad["execution_boundary"]["wait_for_stability"] = True
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval(bad))
+        bad = deepcopy(target)
+        bad["task_success_implementation"]["files"]["task-success-v1.json"] = "changed"
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval(bad))
+
     def test_sampling_axis_keeps_update_count_and_spikes(self):
         """每采样批仅一个日志点，更新累计数和逐mini尖峰不能被平均抹掉。"""
         from verl.experimental.physical_ai.training_metrics import sampling_batch_metrics

@@ -1,5 +1,12 @@
 # Physical AI 的 verl 接入
 
+2026-10-18执行对齐：新在线任务必须显式声明`wait_for_stability`，默认false，
+恢复源状态且不重设控制目标；旧包需用数据侧`ours.rl.bind_online`重新绑定，不改旧包。
+QA环境分叉保留传感器相位/读数缓存及成功monitor历史，核验刷新不改变父分支。
+任务包记录初始化选择/实现hash，训练契约记录`execution_boundary`；旧v5 run保持冻结。
+接续旧checkpoint仅允许显式`gs-v1.1-source-start-v1`迁移，保持题目、源初态、算法、
+预算和成功登记不变。GS-05的SFT尾部100步不自动进入在线任务。
+
 2026-10-18后续：新配置使用GS-10共同成功monitor，并启用
 `unknown_qa_policy=retain_action_skip_qa_group`。旧冻结profile保留旧行为；以下历史
 “原生成功／任意unknown停止”的说明不覆盖本修订。标准入口为主仓

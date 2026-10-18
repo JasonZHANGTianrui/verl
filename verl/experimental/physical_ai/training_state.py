@@ -239,7 +239,7 @@ def validate_resume_contract(source, target, migration=None):
     migration必须精确绑定来源与目标契约SHA。数据、算法配置、原始权重、处理器
     等其他字段始终严格相同，不能把迁移当作跳过校验的开关。显式online_execution_rebind
     仅接由原任务逐字段核验的新在线条件；任务ID/算法/源权重必须保持。
-    唯一协议迁移例外为GS-10共同成功及整组未知QA处理；其余优化/采样参数不变。
+    协议例外分别为GS-10/未知QA和GS-02/06起点/分叉修复；其余优化/采样参数不变。
     """
     if source == target and migration is None:
         return
@@ -249,10 +249,13 @@ def validate_resume_contract(source, target, migration=None):
     }
     rebind = migration is not None and migration.get("online_execution_rebind") is True
     protocol = migration is not None and migration.get("protocol_revision") == "gs-v1.1-unknown-qa-v1"
+    source_start = migration is not None and migration.get("protocol_revision") == "gs-v1.1-source-start-v1"
     if rebind:
         expected["online_execution_rebind"] = True
     if protocol:
         expected["protocol_revision"] = "gs-v1.1-unknown-qa-v1"
+    if source_start:
+        expected["protocol_revision"] = "gs-v1.1-source-start-v1"
     if migration != expected:
         raise ValueError("恢复配置/数据或显式迁移批准不一致")
     excluded = {"world_size", "implementation_files"}
@@ -274,6 +277,26 @@ def validate_resume_contract(source, target, migration=None):
         ):
             raise ValueError("协议迁移只能启用共同成功判据与整组未知QA排除")
         excluded.update({"config", "task_success_implementation"})
+    if source_start:
+        # 本迁移仅修执行起点/观察/分叉；问题、算法、预算、奖励语义不能一起变化。
+        old_success = source.get("task_success_implementation", {})
+        new_success = target.get("task_success_implementation", {})
+        if (
+            not rebind
+            or source["config"] != target["config"]
+            or target.get("execution_boundary")
+            != {
+                "version": "rl-source-start-and-fork-v1",
+                "wait_for_stability": False,
+                "refresh": "libero-refresh-preserve-sampling-v1",
+            }
+            or old_success.get("version") != "libero-task-success-v1"
+            or new_success.get("version") != old_success.get("version")
+            or not old_success.get("files", {}).get("task-success-v1.json")
+            or new_success.get("files", {}).get("task-success-v1.json") != old_success["files"]["task-success-v1.json"]
+        ):
+            raise ValueError("源起点迁移必须保持算法/任务判据，显式重绑定到无等待且完整分叉版本")
+        excluded.update({"execution_boundary", "task_success_implementation"})
     if rebind:
         # train启动时已读取原任务表并逐字段核对只新增online_execution；此处绑定来源。
         proof = target.get("task_rebind", {})
@@ -290,7 +313,9 @@ def validate_resume_contract(source, target, migration=None):
         ):
             raise ValueError("缺少原问题/初态不变的在线执行重绑定凭据")
         excluded.update({"tasks_sha256", "task_rebind"})
-    if {k: v for k, v in source.items() if k not in excluded} != {k: v for k, v in target.items() if k not in excluded}:
+    if {k: v for k, v in source.items() if k not in excluded} != {
+        k: v for k, v in target.items() if k not in excluded
+    }:
         raise ValueError("迁移不能改变训练配置/数据/权重")
     if any(type(c.get("world_size")) is not int or c["world_size"] < 1 for c in (source, target)):
         raise ValueError("迁移卡数必须为正整数")
