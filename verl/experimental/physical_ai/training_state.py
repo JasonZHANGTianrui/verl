@@ -268,12 +268,15 @@ def validate_resume_contract(source, target, migration=None):
     rebind = migration is not None and migration.get("online_execution_rebind") is True
     protocol = migration is not None and migration.get("protocol_revision") == "gs-v1.1-unknown-qa-v1"
     source_start = migration is not None and migration.get("protocol_revision") == "gs-v1.1-source-start-v1"
+    dummy = migration is not None and migration.get("protocol_revision") == "gs-v1.2-dummy10-v1"
     if rebind:
         expected["online_execution_rebind"] = True
     if protocol:
         expected["protocol_revision"] = "gs-v1.1-unknown-qa-v1"
     if source_start:
         expected["protocol_revision"] = "gs-v1.1-source-start-v1"
+    if dummy:
+        expected["protocol_revision"] = "gs-v1.2-dummy10-v1"
     if migration != expected:
         raise ValueError("恢复配置/数据或显式迁移批准不一致")
     excluded = {"world_size", "implementation_files"}
@@ -315,6 +318,39 @@ def validate_resume_contract(source, target, migration=None):
         ):
             raise ValueError("源起点迁移必须保持算法/任务判据，显式重绑定到无等待且完整分叉版本")
         excluded.update({"execution_boundary", "task_success_implementation"})
+    if dummy:
+        # GS v1.2只允许更换准备边界；不连带修改奖励、采样、任务或优化器配置。
+        boundary = target.get("execution_boundary", {})
+        preparation = boundary.get("preparation", {})
+        recipe = {key: value for key, value in preparation.items() if key != "implementation_sha256"}
+        digest = preparation.get("implementation_sha256", "")
+        if (
+            not rebind
+            or source.get("execution_boundary")
+            != {
+                "version": "rl-source-start-and-fork-v1",
+                "wait_for_stability": False,
+                "refresh": "libero-refresh-preserve-sampling-v1",
+            }
+            or {k: v for k, v in boundary.items() if k != "preparation"}
+            != {
+                "version": "rl-online-preparation-v2",
+                "wait_for_stability": False,
+                "refresh": "libero-refresh-preserve-sampling-v1",
+            }
+            or recipe
+            != {
+                "version": "libero-online-dummy10-open-v1",
+                "steps": 10,
+                "control_hz": 20,
+                "action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            }
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(c not in "0123456789abcdef" for c in digest)
+        ):
+            raise ValueError("dummy迁移必须绑定固定10步开爪配方及实现身份")
+        excluded.add("execution_boundary")
     if rebind:
         # train启动时已读取原任务表并逐字段核对只新增online_execution；此处绑定来源。
         proof = target.get("task_rebind", {})

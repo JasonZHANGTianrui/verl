@@ -280,6 +280,61 @@ class TrainingStateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_resume_contract(source, target, bad_chain)
 
+    def test_dummy_migration_rejects_duration_control_and_algorithm_changes(self):
+        """源时钟不豁免准备；只允许固定10步开爪，不能顺便改变算法或任务目标。"""
+        from copy import deepcopy
+
+        source = dict(
+            world_size=8,
+            config={"batch_size": 128},
+            tasks_sha256="old",
+            execution_boundary={
+                "version": "rl-source-start-and-fork-v1",
+                "wait_for_stability": False,
+                "refresh": "libero-refresh-preserve-sampling-v1",
+            },
+        )
+        target = deepcopy(source)
+        target.update(
+            tasks_sha256="new",
+            task_rebind={"source_tasks_sha256": "old", "target_tasks_sha256": "new", "preserved_tasks_sha256": "same"},
+        )
+        target["execution_boundary"].update(
+            version="rl-online-preparation-v2",
+            preparation={
+                "version": "libero-online-dummy10-open-v1",
+                "steps": 10,
+                "control_hz": 20,
+                "action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                "implementation_sha256": "a" * 64,
+            },
+        )
+
+        def approval(dst):
+            """绑定本次来源和目标内容，不允许模糊放行。"""
+            return dict(
+                source_contract_sha256=contract_hash(source),
+                target_contract_sha256=contract_hash(dst),
+                protocol_revision="gs-v1.2-dummy10-v1",
+                online_execution_rebind=True,
+            )
+
+        validate_resume_contract(source, target, approval(target))
+        for key, value in (
+            ("steps", 5),
+            ("action", [0.0] * 7),
+            ("control_hz", 10),
+            ("implementation_sha256", "unknown"),
+        ):
+            bad = deepcopy(target)
+            bad["execution_boundary"]["preparation"][key] = value
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, bad, approval(bad))
+        bad = deepcopy(target)
+        bad["config"]["batch_size"] = 64
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, bad, approval(bad))
+
     def test_sampling_axis_keeps_update_count_and_spikes(self):
         """每采样批仅一个日志点，更新累计数和逐mini尖峰不能被平均抹掉。"""
         from verl.experimental.physical_ai.training_metrics import sampling_batch_metrics

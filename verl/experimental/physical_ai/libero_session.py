@@ -208,14 +208,27 @@ class LiberoSession:
         physics_patch: str | None = None,
         initial_condition=None,
         wait_for_stability: bool = False,
+        initialization_policy: str = "libero-online-dummy10-open-v1",
+        _fork_restore: bool = False,
     ):
         """构造并恢复源初态；预算按20Hz控制步计，不含显式启用的初始化等待。
 
-        初始状态从官方suite读取。使用统一光照及隐藏辅助site；默认不等待、不重设
-        控制目标。wait_for_stability=True仅作显式v5对照，选择随分叉继承。
+        默认在最终恢复后执行共享10步开爪dummy，再允许模型接收任务和首观察。
+        initialization_policy可显式选择历史无等待或v5对照，wait开关须与策略匹配。
+        _fork_restore只供fork构造空容器，跳过全部等待/dummy，随后完整继承父状态。
         initial_condition显式提供时从训练示范XML/states[0]恢复，不索引官方测试初态。
         初始化失败会关闭已创建环境并抛异常，不能当成模型任务失败。
         """
+        from benchmark.adapters.libero_initialization import NO_WAIT_VERSION
+        from benchmark.adapters.libero_initialization import VERSION as WAIT_VERSION
+        from benchmark.adapters.libero_online import VERSION as ONLINE_VERSION
+
+        if initialization_policy not in {NO_WAIT_VERSION, WAIT_VERSION, ONLINE_VERSION}:
+            raise ValueError("未知在线初始化策略")
+        if wait_for_stability != (initialization_policy == WAIT_VERSION):
+            raise ValueError("wait开关与显式初始化策略不一致")
+        if type(_fork_restore) is not bool:
+            raise ValueError("分叉恢复标志必须为bool")
         if type(wait_for_stability) is not bool:
             raise ValueError("wait_for_stability必须是显式布尔值")
         if type(max_steps) is not int or max_steps <= 0:
@@ -234,6 +247,7 @@ class LiberoSession:
             physics_patch=physics_patch,
             initial_condition=initial_condition,
             wait_for_stability=wait_for_stability,
+            initialization_policy=initialization_policy,
         )
         self.owner = (os.getpid(), threading.get_ident())
         self.env = None
@@ -249,11 +263,19 @@ class LiberoSession:
                 if physics_patch is not None:
                     raise ValueError("训练示范初态不能叠加未声明物理补丁")
                 self.env, task, _, self.observation = open_environment(
-                    initial_condition, suite, resolution, seed=seed, wait_for_stability=wait_for_stability
+                    initial_condition,
+                    suite,
+                    resolution,
+                    seed=seed,
+                    wait_for_stability=wait_for_stability and not _fork_restore,
                 )
             else:
                 self.env, task, states = make_env(
-                    suite, task_index, resolution, physics_patch=physics_patch, wait_for_stability=wait_for_stability
+                    suite,
+                    task_index,
+                    resolution,
+                    physics_patch=physics_patch,
+                    wait_for_stability=wait_for_stability and not _fork_restore,
                 )
                 self.env.seed(seed)
                 self.env.reset()
@@ -261,9 +283,12 @@ class LiberoSession:
                     raise IndexError("初始状态索引越界")
                 self.observation = self.env.set_init_state(states[initial_state_index])
             self.task = task.language
-            # 统一set_init_state按显式策略准备首观察；false不更新控制目标，回执即第0步。
-            self.preparation = deepcopy(self.env.preparation)
             bind_render_context(self.env.env.sim)
+            if initialization_policy == ONLINE_VERSION and not _fork_restore:
+                from benchmark.adapters.libero_online import prepare_online_scene
+
+                self.observation = prepare_online_scene(self.env)
+            self.preparation = deepcopy(self.env.preparation)
             from OpenGL import GL
 
             self.env.env.sim._render_context_offscreen.gl_ctx.make_current()
@@ -370,10 +395,13 @@ class LiberoSession:
         numpy_rng, python_rng = np.random.get_state(), random.getstate()
         child = None
         try:
-            child = type(self)(**self.settings)
+            child = type(self)(**self.settings, _fork_restore=True)
             visual_runtime = copy_visual_runtime(self.env.env, child.env.env)
             clone_runtime(self.env, child.env)
             child.preparation = deepcopy(self.preparation)
+            child.env.preparation = deepcopy(self.env.preparation)
+            child.env.scene_initialization = deepcopy(self.env.scene_initialization)
+            child.env.env.scene_initialization = deepcopy(self.env.scene_initialization)
             child.steps = self.steps
             child.last_action = self.last_action.copy()
             child.action_history = deepcopy(self.action_history)

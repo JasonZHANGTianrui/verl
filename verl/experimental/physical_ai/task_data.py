@@ -185,6 +185,7 @@ def open_task_session(task, resources, *, seed, max_steps, resolution=256):
         resolution=resolution,
         initial_condition=initial,
         wait_for_stability=online["wait_for_stability"],
+        initialization_policy=online["initialization_version"],
     )
     expected = task.get("online_execution", {}).get(
         "initialization_version", task["environment"]["initialization_version"]
@@ -195,11 +196,16 @@ def open_task_session(task, resources, *, seed, max_steps, resolution=256):
     online = task.get("online_execution")
     if online:
         from benchmark.adapters.libero_execution import assert_same_preparation, implementation_identity
+        from benchmark.adapters.libero_online import VERSION as ONLINE_VERSION
+        from benchmark.adapters.libero_online import preparation_identity
         from benchmark.libero.qa_relations import VERSION as relation_version
         from ours.rl.prepare_online import semantic_identity
 
+        expected_online = preparation_identity() if online["initialization_version"] == ONLINE_VERSION else None
+
         if (
-            online["implementation"] != implementation_identity()
+            online.get("online_preparation") != expected_online
+            or online["implementation"] != implementation_identity()
             or online["relation_view"] != relation_version
             or online["semantics"] != semantic_identity()
         ):

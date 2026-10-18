@@ -225,9 +225,23 @@ def main():
             raise ValueError("任务发布必须具有统一、显式的wait_for_stability策略")
         from benchmark.adapters.libero_observation import VERSION as refresh_version
 
+        policies = {r["online_execution"]["initialization_version"] for r in eligible}
+        if len(policies) != 1:
+            raise ValueError("同一训练发布不能混用初始化策略")
+        from benchmark.adapters.libero_online import VERSION as ONLINE_VERSION
+        from benchmark.adapters.libero_online import preparation_identity
+
+        online = policies == {ONLINE_VERSION}
         contract["execution_boundary"] = dict(
-            version="rl-source-start-and-fork-v1", wait_for_stability=waits[0], refresh=refresh_version
+            version="rl-online-preparation-v2" if online else "rl-source-start-and-fork-v1",
+            wait_for_stability=waits[0],
+            refresh=refresh_version,
         )
+        if online:
+            identity = preparation_identity()
+            if any(r["online_execution"].get("online_preparation") != identity for r in eligible):
+                raise ValueError("在线dummy实现/控制配方与任务发布不一致")
+            contract["execution_boundary"]["preparation"] = identity
         from ours.rl.prepare_online import validate_rebind
 
         task_rebind = validate_rebind(args.task_release, rows)
