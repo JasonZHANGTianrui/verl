@@ -252,14 +252,37 @@ def validate_resume_contract(source, target, migration=None):
             or not isinstance(steps, list)
             or len(steps) != 2
             or any(not isinstance(step, dict) or "schema" in step for step in steps)
-            or [step.get("protocol_revision") for step in steps]
-            != ["gs-v1.1-unknown-qa-v1", "gs-v1.1-source-start-v1"]
+            or [step.get("protocol_revision") for step in steps] != ["gs-v1.1-unknown-qa-v1", "gs-v1.1-source-start-v1"]
         ):
             raise ValueError("只接受已授权的共同成功/未知QA→源起点两段迁移")
         validate_resume_contract(source, middle, steps[0])
         validate_resume_contract(middle, target, steps[1])
         return
     if source == target and migration is None:
+        return
+    if migration is not None and migration.get("protocol_revision") == "generation-timeout-increase-v1":
+        # 秒数只保护推理基础设施；显式放宽时仍保留token/动作预算、数据、奖励和完整组。
+        # 精确绑定两端契约，不允许把超时恢复变成更换算法或模型的通用旁路。
+        import math
+
+        expected = dict(
+            source_contract_sha256=contract_hash(source),
+            target_contract_sha256=contract_hash(target),
+            protocol_revision="generation-timeout-increase-v1",
+        )
+        old_config, new_config = dict(source["config"]), dict(target["config"])
+        before = old_config.pop("generation_timeout_seconds", 180)
+        after = new_config.pop("generation_timeout_seconds", None)
+        unchanged = {"config", "implementation_files"}
+        if (
+            migration != expected
+            or any(type(value) not in (int, float) or not math.isfinite(value) for value in (before, after))
+            or not 0 < before < after
+            or old_config != new_config
+            or {k: v for k, v in source.items() if k not in unchanged}
+            != {k: v for k, v in target.items() if k not in unchanged}
+        ):
+            raise ValueError("超时恢复只允许增大有限生成秒数及已审核代码身份，其余契约须保持一致")
         return
     expected = {
         "source_contract_sha256": contract_hash(source),
@@ -367,9 +390,7 @@ def validate_resume_contract(source, target, migration=None):
         ):
             raise ValueError("缺少原问题/初态不变的在线执行重绑定凭据")
         excluded.update({"tasks_sha256", "task_rebind"})
-    if {k: v for k, v in source.items() if k not in excluded} != {
-        k: v for k, v in target.items() if k not in excluded
-    }:
+    if {k: v for k, v in source.items() if k not in excluded} != {k: v for k, v in target.items() if k not in excluded}:
         raise ValueError("迁移不能改变训练配置/数据/权重")
     if any(type(c.get("world_size")) is not int or c["world_size"] < 1 for c in (source, target)):
         raise ValueError("迁移卡数必须为正整数")

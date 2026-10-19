@@ -110,6 +110,12 @@ API错误或未知GT阻止整组更新；全同分组优势为0，不重采制�
 
 ## 连续训练与SwanLab
 
+生成超时的恢复可用`generation-timeout-increase-v1`迁移：仅允许将
+`generation_timeout_seconds`增大为有限正数，其他配置、任务、模型、拓扑及执行
+边界保持不变。源/目标契约SHA仍须精确绑定；从完整checkpoint恢复模型、优化器
+和RNG到新输出目录。未保存的批次重跑，旧记录保留。超时的半条消息不当EOS、
+不执行其工具、不填奖励，token/动作预算也不因等待时间增长而放宽。
+
 `train`复用`pilot.collect_group`和`native_update.update_once`，没有另一份模型生成或
 奖励实现。旧stage1使用FP32、持久SGD、rank0采集；新batch配置可按任务跨rank并行
 采集，完整收齐后再切mini-batch，所有rank按响应分片重算策略梯度。它是fork中的原生PyTorch分布式接入，不是Ray/FSDP

@@ -127,6 +127,48 @@ def _reshard_adam_worker(rank, directory):
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
 
+    def test_generation_timeout_recovery_preserves_training_contract(self):
+        """基础设施超时只可有限延长；不能夹带预算、奖励、拓扑、数据或模型修改。"""
+        from copy import deepcopy
+
+        source = dict(
+            world_size=8,
+            tasks_sha256="tasks",
+            source_checkpoint_sha256="weights",
+            implementation_files={"training_state.py": "old"},
+            config=dict(generation_timeout_seconds=120, execution_token_budget=6144, learning_rate=1e-6),
+        )
+        target = deepcopy(source)
+        target["config"]["generation_timeout_seconds"] = 1800
+        target["implementation_files"]["training_state.py"] = "new"
+
+        def approval(dst):
+            """绑定待恢复的准确配置，避免旧批准适用于其他改动。"""
+            return dict(
+                source_contract_sha256=contract_hash(source),
+                target_contract_sha256=contract_hash(dst),
+                protocol_revision="generation-timeout-increase-v1",
+            )
+
+        validate_resume_contract(source, target, approval(target))
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, target)
+        for value in (None, True, 0, 120, float("inf"), float("nan")):
+            bad = deepcopy(target)
+            bad["config"]["generation_timeout_seconds"] = value
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, bad, approval(bad))
+        for key, value in (("execution_token_budget", 8192), ("learning_rate", 1e-4)):
+            bad = deepcopy(target)
+            bad["config"][key] = value
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, bad, approval(bad))
+        for key, value in (("world_size", 4), ("tasks_sha256", "other"), ("source_checkpoint_sha256", "other")):
+            bad = deepcopy(target)
+            bad[key] = value
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, bad, approval(bad))
+
     def test_explicit_unknown_qa_and_shared_reward_migration_is_narrow(self):
         """批准GS迁移也不能夹带学习率/batch/数据变化；来源和目标契约必须精确绑定。"""
         from copy import deepcopy
@@ -236,9 +278,7 @@ class TrainingStateTests(unittest.TestCase):
         target = deepcopy(middle)
         target.update(
             tasks_sha256="target",
-            task_rebind=dict(
-                source_tasks_sha256="source", target_tasks_sha256="target", preserved_tasks_sha256="same"
-            ),
+            task_rebind=dict(source_tasks_sha256="source", target_tasks_sha256="target", preserved_tasks_sha256="same"),
             execution_boundary=dict(
                 version="rl-source-start-and-fork-v1",
                 wait_for_stability=False,
