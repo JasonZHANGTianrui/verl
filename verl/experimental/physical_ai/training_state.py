@@ -194,19 +194,36 @@ def cpu_tree(value):
     return value
 
 
-def save_boundary(policy, optimizer, directory, *, completed_groups, optimizer_steps, contract, rng_states):
+def save_boundary(
+    policy,
+    optimizer,
+    directory,
+    *,
+    completed_groups,
+    optimizer_steps,
+    contract,
+    rng_states,
+    model_directory=None,
+    completed_sampling_batches=None,
+):
     """原子保存完整策略、优化器、游标和每rank RNG，最后才发布可恢复manifest。
 
     directory必须新建。读者只接受已发布的checkpoint.json；写到一半的building文件
     不可恢复。这里只在整组采集/更新完成后调用，不将父环境或半个QA组当可恢复点。
+    可选model_directory另存长期保留的纯模型快照；批数按采样batch计，不是优化更新数。
+    两份存档共用同一CPU模型快照，纯模型不含优化器/RNG，不能用于完整训练恢复。
+    先完成两份写入/内容hash才发布完整恢复凭据；失败时调用方不得清理上一恢复点。
     """
+    if model_directory is not None and (type(completed_sampling_batches) is not int or completed_sampling_batches < 1):
+        raise ValueError("纯模型快照需要明确正整数采样批数")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     path = directory / "training.pt"
     temporary = directory / "training.building"
+    model_state = cpu_tree(policy.state_dict())
     torch.save(
         dict(
-            model_state_dict=cpu_tree(policy.state_dict()),
+            model_state_dict=model_state,
             optimizer_state_dict=cpu_tree(optimizer.state_dict()),
             completed_groups=completed_groups,
             optimizer_steps=optimizer_steps,
@@ -224,6 +241,34 @@ def save_boundary(policy, optimizer, directory, *, completed_groups, optimizer_s
         optimizer_steps=optimizer_steps,
         contract=contract,
     )
+    if model_directory is not None:
+        model_directory = Path(model_directory)
+        model_directory.mkdir(parents=True, exist_ok=False)
+        model_path = model_directory / "model.pt"
+        building = model_directory / "model.building"
+        torch.save(
+            dict(
+                model_state_dict=model_state,
+                completed_sampling_batches=completed_sampling_batches,
+                completed_groups=completed_groups,
+                optimizer_steps=optimizer_steps,
+                schema="physical-ai.seggrpo-model.v1",
+            ),
+            building,
+        )
+        building.rename(model_path)
+        model_receipt = dict(
+            path=str(model_path.resolve()),
+            sha256=content_hash(model_path),
+            completed_sampling_batches=completed_sampling_batches,
+            completed_groups=completed_groups,
+            optimizer_steps=optimizer_steps,
+            contract=contract,
+            source_training_sha256=receipt["sha256"],
+            includes_optimizer=False,
+        )
+        save_json(model_directory / "checkpoint.json", model_receipt)
+        receipt["model_snapshot"] = model_receipt
     save_json(directory / "checkpoint.json", receipt)
     return receipt
 

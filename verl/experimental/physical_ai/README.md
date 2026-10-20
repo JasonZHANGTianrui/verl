@@ -110,6 +110,13 @@ API错误或未知GT阻止整组更新；全同分组优势为0，不重采制�
 
 ## 连续训练与SwanLab
 
+`retain_model_snapshots=true`将每个保存点的纯模型另存到
+`model-checkpoints/batch-N/model.pt`并保留，附带配置与SHA凭据。
+`save_freq`仍按采样batch计；例如20对应20/40/60/80/100批。
+`max_ckpt_to_keep=1`只清理`checkpoints/`中的旧完整恢复存档，模型快照不受影响。
+完整恢复继续从`latest.json`读取模型、优化器及RNG；纯模型快照只用于推理/测评。
+新存档及模型快照均成功发布后才清理旧恢复点；默认false保留旧行为。
+
 生成超时的恢复可用`generation-timeout-increase-v1`迁移：仅允许将
 `generation_timeout_seconds`增大为有限正数，其他配置、任务、模型、拓扑及执行
 边界保持不变。源/目标契约SHA仍须精确绑定；从完整checkpoint恢复模型、优化器

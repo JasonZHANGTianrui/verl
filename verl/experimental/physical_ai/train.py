@@ -153,6 +153,9 @@ def main():
         max_groups = training_budget(config, tasks_per_batch)
         save_freq = config.get("save_freq", 1)
         keep = config.get("max_ckpt_to_keep")
+        retain_models = config.get("retain_model_snapshots", False)
+        if type(retain_models) is not bool:
+            raise ValueError("retain_model_snapshots必须为布尔值")
         checkpoint_due(1, save_freq)
         if keep is not None and (type(keep) is not int or keep < 1):
             raise ValueError("max_ckpt_to_keep须为正整数或null")
@@ -526,6 +529,12 @@ def main():
                             optimizer_steps=updates,
                             contract=contract,
                             rng_states=states,
+                            model_directory=(
+                                args.output / f"model-checkpoints/batch-{batch_index + 1:06d}"
+                                if retain_models
+                                else None
+                            ),
+                            completed_sampling_batches=batch_index + 1,
                         )
                         save_json(args.output / "latest.json", receipt)
                         removed = prune_checkpoints(args.output / "checkpoints", receipt, keep)

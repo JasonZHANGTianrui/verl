@@ -512,6 +512,63 @@ class TrainingStateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_fixed_algorithm(change)
 
+    def test_model_snapshots_survive_latest_optimizer_retention(self):
+        """每20批的模型永久保留，完整恢复仅留最新；两份参数一致且写失败不删旧点。"""
+        from unittest.mock import patch
+
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.AdamW(model.parameters())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for batch in (20, 40):
+                optimizer.zero_grad()
+                model(torch.ones(1, 2)).sum().backward()
+                optimizer.step()
+                receipt = save_boundary(
+                    model,
+                    optimizer,
+                    root / f"checkpoints/group-{batch * 8:06d}",
+                    completed_groups=batch * 8,
+                    optimizer_steps=batch * 4,
+                    contract={"fixed": True},
+                    rng_states=[],
+                    model_directory=root / f"models/batch-{batch}",
+                    completed_sampling_batches=batch,
+                )
+                snapshot = torch.load(receipt["model_snapshot"]["path"], weights_only=True)
+                self.assertNotIn("optimizer_state_dict", snapshot)
+                self.assertEqual(snapshot["completed_sampling_batches"], batch)
+                for key, value in model.state_dict().items():
+                    torch.testing.assert_close(snapshot["model_state_dict"][key], value, rtol=0, atol=0)
+                prune_checkpoints(root / "checkpoints", receipt, 1)
+            self.assertEqual(len(list((root / "checkpoints").glob("*/training.pt"))), 1)
+            self.assertEqual(len(list((root / "models").glob("*/model.pt"))), 2)
+            latest = root / "checkpoints/group-000320/checkpoint.json"
+            state, _ = load_boundary(latest, {"fixed": True})
+            self.assertTrue(state["optimizer_state_dict"]["state"])
+            original_save = torch.save
+
+            def fail_model(obj, path):
+                """模拟纯模型写入失败，不把半套保存误发布为完整恢复点。"""
+                if Path(path).name == "model.building":
+                    raise OSError("disk full")
+                return original_save(obj, path)
+
+            with patch("torch.save", side_effect=fail_model), self.assertRaises(OSError):
+                save_boundary(
+                    model,
+                    optimizer,
+                    root / "checkpoints/group-000480",
+                    completed_groups=480,
+                    optimizer_steps=240,
+                    contract={"fixed": True},
+                    rng_states=[],
+                    model_directory=root / "models/batch-60",
+                    completed_sampling_batches=60,
+                )
+            self.assertFalse((root / "checkpoints/group-000480/checkpoint.json").exists())
+            self.assertTrue(latest.exists())
+
     def test_zero_adam_matches_reference_after_resume(self):
         """优化器状态分片/同步及重载不能改变AdamW实际数值更新。"""
         import torch.multiprocessing as mp
