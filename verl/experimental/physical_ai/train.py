@@ -84,13 +84,12 @@ def main():
     import torch.distributed as dist
     from runtime import load_policy
 
-    from .batching import minibatch_indices, namespace_group, prepare_batch
+    from .algorithms import resolve_algorithm
     from .native_update import update_once, validate_behavior
     from .online_reward import save_json
-    from .pilot import collect_group
     from .precision import stable_delta_precision
     from .task_data import load_task_release
-    from .training_metrics import rollout_metrics, sampling_batch_metrics, update_metrics
+    from .training_metrics import sampling_batch_metrics, update_metrics
     from .training_state import (
         build_optimizer,
         checkpoint_due,
@@ -101,7 +100,6 @@ def main():
         restore_optimizer,
         save_boundary,
         training_budget,
-        validate_fixed_algorithm,
     )
 
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
@@ -132,12 +130,11 @@ def main():
         config = runtime_config
         if config["sampling_mode"] not in {"recompute", "cached"} or config["compute_dtype"] != "float32":
             raise ValueError("此后端仅启用FP32原生重算或经完整轨迹概率核验的缓存采样")
-        algorithm = validate_fixed_algorithm(config)
+        strategy = resolve_algorithm(config)
+        algorithm = strategy.validate_config(config)
         if config["optimizer"] not in {"sgd", "adamw"}:
             raise ValueError("需要合法优化器及正数任务组预算")
-        if min(config["execution_group_size"], config["qa_group_size"]) < 2:
-            raise ValueError("GRPO两组均须至少两条")
-        width = config["execution_group_size"] + config["qa_group_size"]
+        width = strategy.width
         batch_size = config.get("batch_size", width)
         mini_size = config.get("mini_batch_size", batch_size)
         tasks_per_batch = batch_size // width
@@ -387,7 +384,7 @@ def main():
                     args.output / f"progress-rank-{rank}.json",
                     dict(phase="sampling", batch=batch_index, task_index=task_index, finished_tasks=len(local_tasks)),
                 )
-                task_records, task_artifacts = collect_group(
+                task_records, task_artifacts = strategy.collect_group(
                     policy,
                     processor,
                     run_config,
@@ -399,7 +396,7 @@ def main():
                 local_tasks.append(
                     dict(
                         index=task_index,
-                        records=namespace_group(task_records, f"task-{task_index:06d}"),
+                        records=strategy.namespace_group(task_records, f"task-{task_index:06d}"),
                         artifacts=task_artifacts,
                     )
                 )
@@ -415,10 +412,10 @@ def main():
             if len(records) != batch_size:
                 raise ValueError("实际序列数不等于配置batch_size")
             sampling_seconds = time.monotonic() - started
-            prepared = prepare_batch(records, artifacts)
-            batch_metrics = rollout_metrics(records, artifacts, prepared)
+            prepared = strategy.prepare_batch(records, artifacts)
+            batch_metrics = strategy.rollout_metrics(records, artifacts, prepared)
             validation_started = time.monotonic()
-            minis = minibatch_indices(records, mini_size)
+            minis = strategy.minibatch_indices(records, mini_size)
             if rank == 0:
                 from dataclasses import asdict
 
@@ -472,6 +469,7 @@ def main():
                     prepared=prepared,
                     indices=indices,
                     enforce_on_policy=False,
+                    group_validator=strategy.task_groups,
                     clip_ratio=config.get("clip_ratio", 0.2),
                     clip_ratio_c=config.get("clip_ratio_c", 3.0),
                     control_group=control_group,

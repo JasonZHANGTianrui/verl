@@ -108,6 +108,24 @@ API错误或未知GT阻止整组更新；全同分组优势为0，不重采制�
 `checkpoints/step_1.pt`，兼容原加载接口。该文件明确标记为单步SGD诊断，未保存
 生产优化器/调度器/采样器恢复状态；不冒称完整verl Trainer checkpoint。
 
+## 普通 GRPO baseline
+
+`advantage_estimator=grpo`使用独立`grpo.py`和`grpo_rollout.py`，入口仍是`train`。
+同任务采n条独立完整动作→QA，每条沿自身原生会话和真实末态提问，不选共同父经历。
+总回报为0.5×task＋0.5×QA；未知GT或不可交付QA时直接结束，仅用task回报。
+已交付的QA答错/未答计0；API/仿真/数据错误不转换为缺QA。仅token/context预算
+截断可保留原token结束轨迹，不造EOS、不执行半条工具消息；SegGRPO默认仍拒绝该截断。
+
+整条会话的动作和语言使用同一个组内标准化优势，PPO按每条真实生成token均值、
+轨迹均值计算。用户/环境输入不训练。`algorithms.py`显式装配采集/分组/优势/指标；
+默认SegGRPO仍调用原`pilot`、`batching`和`seggrpo`函数，未放宽其二元奖励/父组约束。
+公共更新器只接收分组校验策略；没有模块猴子补丁或另一份优化器实现。
+
+配方`configs/libero2000-grpo-b64-m16-n8.json`是64完整会话/mini16、n8，每批8任务、
+4次mini更新，与SegGRPO128阶段序列/mini32匹配任务与动作采样量。总100批；
+每20批保留纯模型快照，完整优化器仅latest。两算法的batch单位不同，报告时明确。
+普通算法记录task、QA和总reward及task-only原因；不会把缺QA计成QA答错。
+
 ## 连续训练与SwanLab
 
 `retain_model_snapshots=true`将每个保存点的纯模型另存到

@@ -91,7 +91,7 @@ def update_metrics(result, records, indices):
     if result.get("grad_norm_before_clip") is not None:
         metrics["actor/grad_norm"] = result["grad_norm_before_clip"]
     metrics["actor/policy_loss"] = sum(r["loss"] for r in rows)
-    for phase in ("execution", "qa"):
+    for phase in sorted({"execution", "qa"} | {r.phase for r in records}):
         phase_rows = [r for r in rows if r["phase"] == phase]
         count = sum(records[i].phase == phase and records[i].reward_status == "scored" for i in indices)
         prefix = f"actor/{phase}"

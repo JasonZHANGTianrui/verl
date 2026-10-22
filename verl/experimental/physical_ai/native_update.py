@@ -43,6 +43,7 @@ def update_once(
     clip_ratio=0.2,
     clip_ratio_c=3.0,
     control_group=None,
+    group_validator=None,
 ):
     """收齐组后逐条重算、累积两阶段GRPO梯度，执行一次优化器更新并记录真实变化。
 
@@ -75,7 +76,7 @@ def update_once(
     indices = list(range(len(records))) if indices is None else list(indices)
     selected_records = [records[i] for i in indices]
     selected_artifacts = [artifacts[i] for i in indices]
-    pairs = task_groups(selected_records)
+    pairs = (group_validator or task_groups)(selected_records)
     old, advantages, active = (prepared[k][indices] for k in ("old", "advantages", "active"))
     phases = {r.group_id for r in selected_records}
     stats = dict(
@@ -92,7 +93,7 @@ def update_once(
         return result
     phase_sizes = {
         phase: sum(r.phase == phase and r.reward_status == "scored" for r in selected_records)
-        for phase in ["execution", "qa"]
+        for phase in {r.phase for r in selected_records}
     }
     config = OmegaConf.create(
         dict(

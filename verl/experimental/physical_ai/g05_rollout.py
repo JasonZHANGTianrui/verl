@@ -56,6 +56,7 @@ def phase_steps(
     max_calls=None,
     per_message_budget=False,
     timeout_seconds=120,
+    allow_budget_truncation=False,
 ):
     """采集一个阶段并保存全部原始生成ID与概率，工具观察不标成策略输出。
 
@@ -64,7 +65,8 @@ def phase_steps(
     仅正常无工具响应或执行预算耗尽结束阶段；错误工具输出记录为模型错误而不补动作。
     每个模型调用以yield交给调度器，收到原token/概率后继续实际执行；多个generator
     可在同一owner线程交错运行，使独立会话的生成请求形成GPU batch。
-    未完成消息的生成截断显式抛错，当前诊断不伪造EOS拼接后续回合。
+    默认仍拒绝未完成消息。普通GRPO可显式保留token/context预算截断的原token，
+    不补EOS、不执行其中工具，由上层结束整条经历；基础设施超时继续抛错。
     """
     import imageio.v2 as imageio
     from experiments.libero.libero_eval_utils import (
@@ -103,6 +105,7 @@ def phase_steps(
     timings = dict(environment_step_seconds=0.0, scene_capture_seconds=0.0, video_append_seconds=0.0)
     pending = False
     termination = "execution_budget"
+    incomplete_message = False
     video = imageio.get_writer(str(directory / "scene.mp4"), fps=20, codec="libx264")
     video.append_data(extract_libero_images(session.observation)["image"])
     try:
@@ -117,6 +120,10 @@ def phase_steps(
                 int(engine.model.cfg.vlm.max_position_embeddings) - len(chat.ids),
             )
             if budget < 1:
+                if allow_budget_truncation:
+                    termination = "context_capacity"
+                    incomplete_message = True
+                    break
                 raise RuntimeError("native_context_capacity_exhausted")
             response = yield dict(
                 engine=engine,
@@ -148,13 +155,19 @@ def phase_steps(
             )
             save_json(directory / f"call-{len(traces):03d}.json", trace)
             traces.append(trace)
-            if response["termination"] != "message_end":
+            truncated = allow_budget_truncation and response["termination"] in {"token_budget", "context_capacity"}
+            if response["termination"] != "message_end" and not truncated:
                 raise RuntimeError("unsupported_incomplete_message:" + response["termination"])
             chat.append_generated(ids)
             generated.extend([True] * len(ids))
             old_logprobs.extend(response["logprobs"])
             consumed += len(ids)
             pending = False
+            if truncated:
+                termination = response["termination"]
+                incomplete_message = True
+                responses.append(public_text(text))
+                break
             from .tool_messages import append_results, message_requests
 
             requests, ordinary, rejected = message_requests(text, ids, chat.tokenizer, chat.policy.action_tokenizer)
@@ -248,6 +261,8 @@ def phase_steps(
             timings=timings,
             render_backend=session.render_backend,
         )
+        if allow_budget_truncation:
+            result["incomplete_message"] = incomplete_message
         save_json(
             directory / "controls.json",
             dict(
