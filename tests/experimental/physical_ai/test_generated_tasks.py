@@ -12,6 +12,22 @@ from verl.experimental.physical_ai.training_state import content_hash
 
 
 class GeneratedTasksTest(unittest.TestCase):
+    def test_source_preparation_does_not_claim_phase_directory(self):
+        """实际建准备目录后，动作阶段仍可独占新建目录；旧源不增加运行字段。"""
+        from verl.experimental.physical_ai.task_data import task_for_rollout
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = {"schema": module.SCHEMA, "id": "original"}
+            bound = task_for_rollout(task, root, "execution-0")
+            Path(bound["_runtime_output"]).mkdir(parents=True)
+            (root / "execution-0").mkdir(exist_ok=False)
+            self.assertNotIn("_runtime_output", task)
+            old = {"schema": "legacy"}
+            self.assertIs(task_for_rollout(old, root, "execution-0"), old)
+            with self.assertRaises(ValueError):
+                task_for_rollout(task, root, "../escape")
+
     def test_source_and_budget_dispatch(self):
         """生成任务不可借旧HDF5类型进入；单目标按300而非suite90的520。"""
         task = dict(

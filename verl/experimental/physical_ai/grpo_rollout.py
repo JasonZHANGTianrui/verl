@@ -26,7 +26,13 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     from .online_reward import bind_delivery, save_json, score_answer
     from .sampling import fork_chat
     from .seggrpo import Segment
-    from .task_data import SHARED_ACTION_RULE, create_scene_capture, open_task_session, task_reward_at_delivery
+    from .task_data import (
+        SHARED_ACTION_RULE,
+        create_scene_capture,
+        open_task_session,
+        task_for_rollout,
+        task_reward_at_delivery,
+    )
 
     if task is None or resources is None or config["task_rule"]["version"] != SHARED_ACTION_RULE:
         raise ValueError("普通GRPO仅接已绑定共同成功规则的真实训练任务")
@@ -49,11 +55,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         identity = f"trajectory-{i}"
         directory = Path(output) / identity
         with open_task_session(
-            (
-                {**task, "_runtime_output": str(directory / "source")}
-                if task.get("schema") == "physical-ai.generated-rl-task.v1"
-                else task
-            ),
+            task_for_rollout(task, output, identity),
             resources,
             seed=config["environment_seed"],
             max_steps=config["execution_steps"] + config["qa_steps"],

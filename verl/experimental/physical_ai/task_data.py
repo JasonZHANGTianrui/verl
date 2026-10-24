@@ -25,6 +25,19 @@ EVALUATION_ACTION_RULE = "libero-native-at-question-delivery-v1"
 SHARED_ACTION_RULE = "libero-shared-at-question-delivery-v1"
 
 
+def task_for_rollout(task, output, rollout_id):
+    """为新源分配独立准备目录，不能提前占用phase_steps要求新建的阶段目录。
+
+    output为任务组私有输出根，rollout_id为组内单条名称。旧示范记录原对象返回；
+    新源仅复制字典添加运行目录，不修改发布记录、题目、目标或来源内容身份。
+    """
+    if task.get("schema") != "physical-ai.generated-rl-task.v1":
+        return task
+    if not rollout_id or Path(rollout_id).name != rollout_id:
+        raise ValueError("需要组内单层rollout名称")
+    return {**task, "_runtime_output": str(Path(output) / "sources" / rollout_id)}
+
+
 def needs_preparation_reference(online, *, seed, resolution):
     """区分历史预演回执与新在线校验契约；新模式不要求提前模拟同一个初态。
 
