@@ -23,6 +23,7 @@ import torch
 from verl.experimental.physical_ai.training_state import (
     build_optimizer,
     checkpoint_due,
+    checkpoint_plan,
     contract_hash,
     load_boundary,
     prune_checkpoints,
@@ -126,6 +127,17 @@ def _reshard_adam_worker(rank, directory):
 
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
+
+    def test_recovery_and_model_checkpoint_frequencies(self):
+        """恢复每5批而测评每20批；未配置仍保持旧频率，末批两种都保存。"""
+        self.assertEqual(checkpoint_plan(5, 20, 5), (True, False))
+        self.assertEqual(checkpoint_plan(20, 20, 5), (True, True))
+        self.assertEqual(checkpoint_plan(6, 20, 5), (False, False))
+        self.assertEqual(checkpoint_plan(5, 20), (False, False))
+        self.assertEqual(checkpoint_plan(7, 20, 5, final=True), (True, True))
+        for value in [0, -1, True, 1.5]:
+            with self.assertRaises(ValueError):
+                checkpoint_plan(20, 20, value)
 
     def test_generation_timeout_recovery_preserves_training_contract(self):
         """基础设施超时只可有限延长；不能夹带预算、奖励、拓扑、数据或模型修改。"""

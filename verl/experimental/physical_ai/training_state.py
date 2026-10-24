@@ -84,6 +84,20 @@ def checkpoint_due(completed_batches, save_freq, *, final=False):
     return final or completed_batches % save_freq == 0
 
 
+def checkpoint_plan(completed_batches, save_freq, recovery_save_freq=None, *, final=False):
+    """分别决定恢复存档与测评快照；频率单位均为完整采样批，默认保持历史行为。
+
+    save_freq控制测评模型快照；可选recovery_save_freq只增加完整恢复存档，不增加
+    测评权重。模型快照仍依赖同一次完整保存，因此返回(save_full, save_model)。
+    final保存两者；prune仍只管理完整恢复存档的latest，不清理独立模型快照。
+    """
+    model_due = checkpoint_due(completed_batches, save_freq, final=final)
+    recovery_due = checkpoint_due(
+        completed_batches, save_freq if recovery_save_freq is None else recovery_save_freq, final=final
+    )
+    return model_due or recovery_due, model_due
+
+
 def prune_checkpoints(root, latest, keep):
     """新checkpoint和latest发布成功后，仅清理本输出目录的旧完整checkpoint。
 

@@ -171,6 +171,54 @@ class SamplingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare_fork_image(parent, parent[:2])
 
+    def test_fork_render_retry_preserves_threshold_and_cache(self):
+        """瞬时两级差异可重读；持续两级/尺寸错误拒绝，所有路径恢复缓存。"""
+        from unittest.mock import patch
+
+        import numpy as np
+
+        from verl.experimental.physical_ai.libero_session import verify_fork_render
+
+        parent, child = SimpleNamespace(env=object()), SimpleNamespace(env=object())
+        image = np.full((4, 4, 3), 128, dtype=np.uint8)
+        bad = image.copy()
+        bad[0, 0, 0] += 2
+
+        def obs(x):
+            """双图fixture使用相同数组；生产函数必须只读输入。"""
+            return dict(agentview_image=x, robot0_eye_in_hand_image=x)
+
+        with (
+            patch(
+                "benchmark.adapters.libero_observation.refresh_observation",
+                side_effect=[obs(image), obs(bad), obs(image), obs(image)],
+            ),
+            patch("verl.experimental.physical_ai.libero_session.restore_observables") as restore,
+        ):
+            cameras, report = verify_fork_render(parent, child, {})
+            self.assertEqual(len(report["attempts"]), 2)
+            self.assertFalse(report["attempts"][0]["passed"])
+            self.assertEqual(cameras["agentview_image"]["max_delta"], 0)
+            self.assertEqual(restore.call_count, 4)
+        with (
+            patch("benchmark.adapters.libero_observation.refresh_observation", side_effect=[obs(image), obs(bad)] * 3),
+            patch("verl.experimental.physical_ai.libero_session.restore_observables") as restore,
+        ):
+            with self.assertRaisesRegex(ValueError, "连续3次"):
+                verify_fork_render(parent, child, {})
+            self.assertEqual(restore.call_count, 6)
+        with (
+            patch(
+                "benchmark.adapters.libero_observation.refresh_observation", side_effect=[obs(image), obs(image[:2])]
+            ) as refresh,
+            patch("verl.experimental.physical_ai.libero_session.restore_observables") as restore,
+        ):
+            with self.assertRaises(ValueError):
+                verify_fork_render(parent, child, {})
+            self.assertEqual(refresh.call_count, 2)
+            self.assertEqual(restore.call_count, 2)
+        np.testing.assert_array_equal(image, np.full((4, 4, 3), 128, dtype=np.uint8))
+
     def test_packed_cache_keeps_real_history_and_branch_isolation(self):
         """不同历史长度仅补KV，不向递推状态加虚构步骤；拆出的分支拥有独立存储。"""
         configure_workspace()

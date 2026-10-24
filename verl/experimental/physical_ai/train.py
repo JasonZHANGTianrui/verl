@@ -92,7 +92,7 @@ def main():
     from .training_metrics import sampling_batch_metrics, update_metrics
     from .training_state import (
         build_optimizer,
-        checkpoint_due,
+        checkpoint_plan,
         content_hash,
         load_boundary,
         make_tracker,
@@ -152,11 +152,12 @@ def main():
             raise ValueError("batch/mini-batch须由完整任务组组成；当前micro-batch及PPO epochs固定1")
         max_groups = training_budget(config, tasks_per_batch)
         save_freq = config.get("save_freq", 1)
+        recovery_save_freq = config.get("recovery_save_freq")
         keep = config.get("max_ckpt_to_keep")
         retain_models = config.get("retain_model_snapshots", False)
         if type(retain_models) is not bool:
             raise ValueError("retain_model_snapshots必须为布尔值")
-        checkpoint_due(1, save_freq)
+        checkpoint_plan(1, save_freq, recovery_save_freq)
         if keep is not None and (type(keep) is not int or keep < 1):
             raise ValueError("max_ckpt_to_keep须为正整数或null")
         if args.stop_after_groups and args.stop_after_groups % tasks_per_batch:
@@ -553,7 +554,9 @@ def main():
                     mini_metrics.append(metrics)
                     save_json(directory / f"mini-{mini_index:02d}/summary.json", dict(metrics=metrics, update=result))
             completed_now = group_index + tasks_per_batch
-            should_save = checkpoint_due(batch_index + 1, save_freq, final=completed_now == last_group)
+            should_save, model_due = checkpoint_plan(
+                batch_index + 1, save_freq, recovery_save_freq, final=completed_now == last_group
+            )
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             save_started = time.monotonic()
@@ -578,7 +581,7 @@ def main():
                             rng_states=states,
                             model_directory=(
                                 args.output / f"model-checkpoints/batch-{batch_index + 1:06d}"
-                                if retain_models
+                                if retain_models and model_due
                                 else None
                             ),
                             completed_sampling_batches=batch_index + 1,

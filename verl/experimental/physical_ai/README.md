@@ -387,3 +387,15 @@ batch128/mini32仍为真实采样槽位；`sampled`保留所有阶段生成token
 RL160的数据制作机为NumPy Prescott、SciPy SkylakeX；B区默认NumPy SapphireRapids
 会产生约1e-16差异。两库分别匹配后准备身份可完全相同。启动配置/消费者验收绑定
 实际内核与库版本，不能在恢复训练时静默换回自动选择。
+
+### 同态渲染复核与恢复存档（2026-10-25）
+
+QA fork在严格核对物理、模型和渲染变换后，使用`verify_fork_render`进行双图校验。
+保持原每通道≤1量化级门槛；偶发像素超界最多3次同刻重读，每次恢复传感器缓存。
+三次仍超界、结构/状态/传感器错误直接拒绝。模型仍接收原始父观察，重读不推进环境，
+每次结果记录于`fork_validation.render_validation`，不把不同尝试的相机拼起来。
+
+`save_freq`继续控制独立模型快照。可显式设置`recovery_save_freq`，只增加完整
+模型＋优化器＋游标/RNG恢复点；`max_ckpt_to_keep=1`仅保留最新完整恢复点。
+例如`save_freq=20,recovery_save_freq=5`在5/10/15批有恢复点，20批另保留纯模型。
+未配置新字段保持原行为；奖励、采样和更新次数不因保存频率改变。

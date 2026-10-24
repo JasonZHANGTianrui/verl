@@ -66,6 +66,15 @@ def bind_render_context(sim):
     sim._physical_ai_render_bound = True
 
 
+class ForkImageMismatch(ValueError):
+    """同态像素差异超界；与结构/物理错误分开，只有此异常允许有界重读。"""
+
+    def __init__(self, result):
+        """保存原始差异统计，便于重读失败时报告每次实际结果。"""
+        self.result = result
+        super().__init__(f"分叉渲染差异超出1个uint8量化级：{result}")
+
+
 def compare_fork_image(parent, child):
     """在原生uint8精度下核对同一物理状态的独立渲染，返回私有差异记录。
 
@@ -85,8 +94,41 @@ def compare_fork_image(parent, child):
         rule="same-state-uint8-render-lsb-v1",
     )
     if result["max_delta"] > 1:
-        raise ValueError(f"分叉渲染差异超出1个uint8量化级：{result}")
+        raise ForkImageMismatch(result)
     return result
+
+
+def verify_fork_render(parent, child, sensor_state, max_attempts=3):
+    """核对同态双图，最多三次重读数值抖动，返回最终相机统计与完整尝试记录。
+
+    parent/child为LIBERO包装器；调用前须已严格验证模型、积分状态与渲染变换。
+    refresh不推进物理/采样时间，每次finally还原父子传感器缓存；不替换已交付观察。
+    每次两相机都须满足原≤1灰度级门槛，不能拼接不同尝试的通过相机。仅像素
+    mismatch可重试，错误dtype/形状或读取异常立即抛出；持续超界保留每次统计后拒绝。
+    """
+    from benchmark.adapters.libero_observation import refresh_observation
+
+    if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
+        raise ValueError("分叉渲染复核最多允许3次")
+    attempts = []
+    for _ in range(max_attempts):
+        try:
+            parent_current = deepcopy(refresh_observation(parent))
+            child_current = deepcopy(refresh_observation(child))
+        finally:
+            restore_observables(parent.env, sensor_state)
+            restore_observables(child.env, sensor_state)
+        cameras, passed = {}, True
+        for camera in ("agentview_image", "robot0_eye_in_hand_image"):
+            try:
+                cameras[camera] = compare_fork_image(parent_current[camera], child_current[camera])
+            except ForkImageMismatch as exc:
+                cameras[camera] = exc.result
+                passed = False
+        attempts.append(dict(passed=passed, cameras=cameras))
+        if passed:
+            return cameras, dict(rule="same-state-render-retry3-v1", attempts=attempts)
+    raise ValueError(f"分叉双图连续{max_attempts}次超界：{attempts}")
 
 
 def copy_visual_runtime(parent, child):
@@ -412,14 +454,6 @@ class LiberoSession:
             # 后续未到采样点的传感器；传感器闭包仍分别绑定自己的环境。
             sensor_state = snapshot_observables(self.env.env)
             restore_observables(child.env.env, sensor_state)
-            from benchmark.adapters.libero_observation import refresh_observation
-
-            try:
-                parent_current = deepcopy(refresh_observation(self.env))
-                child_current = deepcopy(refresh_observation(child.env))
-            finally:
-                restore_observables(self.env.env, sensor_state)
-                restore_observables(child.env.env, sensor_state)
             if getattr(self, "success_monitor", None) is not None:
                 child.success_monitor = self.success_monitor.fork(child.env)
             child.observation = cached_observation
@@ -443,6 +477,7 @@ class LiberoSession:
             ):
                 if not np.array_equal(getattr(self.env.sim.data, name), getattr(child.env.sim.data, name)):
                     raise ValueError("分支渲染变换与父轨迹不同：" + name)
+            cameras, render_validation = verify_fork_render(self.env, child.env, sensor_state)
             child.fork_validation = dict(
                 visual_runtime=visual_runtime,
                 sensor_state="phase-and-cache-preserved-v1",
@@ -450,10 +485,8 @@ class LiberoSession:
                 physical_state_equal=True,
                 render_transforms_equal=True,
                 initial_observation="exact_parent_copy",
-                cameras={
-                    camera: compare_fork_image(parent_current[camera], child_current[camera])
-                    for camera in ["agentview_image", "robot0_eye_in_hand_image"]
-                },
+                cameras=cameras,
+                render_validation=render_validation,
             )
             return child
         except BaseException:
