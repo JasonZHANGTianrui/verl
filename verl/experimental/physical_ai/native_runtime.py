@@ -12,6 +12,18 @@ _CHAT = None
 _IDENTITY = None
 
 
+def bind_native_api_alias(module):
+    """让新旧适配器引用同一个已验SHA的官方模块，不重载或替换观察转换函数。
+
+    新执行器使用g05_native_api，旧交接使用scripts.serve_policy。只做模块别名；
+    已有不同对象时拒绝，避免另一个工作区的同名模块悄悄覆盖本次加载来源。
+    """
+    existing = sys.modules.get("g05_native_api")
+    if existing is not None and existing is not module:
+        raise ValueError("g05_native_api已绑定另一模块")
+    sys.modules["g05_native_api"] = module
+
+
 def configure_handoff(root, source):
     """按文件SHA装载唯一交接，不以同名模块代替；恢复sys.path以隔离旧环境/GT。
 
@@ -42,6 +54,7 @@ def configure_handoff(root, source):
         except BaseException:
             sys.modules.pop(key, None)
             raise
+    bind_native_api_alias(sys.modules[key])
     # 先绑定本工作区的包，避免模型诊断模块导入其旧版benchmark/数据管线。
     import benchmark
     import ours.sft.conversation
