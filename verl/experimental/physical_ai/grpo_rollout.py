@@ -49,7 +49,14 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         identity = f"trajectory-{i}"
         directory = Path(output) / identity
         with open_task_session(
-            task, resources, seed=config["environment_seed"], max_steps=config["execution_steps"] + config["qa_steps"]
+            (
+                {**task, "_runtime_output": str(directory / "source")}
+                if task.get("schema") == "physical-ai.generated-rl-task.v1"
+                else task
+            ),
+            resources,
+            seed=config["environment_seed"],
+            max_steps=config["execution_steps"] + config["qa_steps"],
         ) as session:
             capture = create_scene_capture(
                 session, task, resources, Path(output) / "scene" / identity, rollout_id=identity

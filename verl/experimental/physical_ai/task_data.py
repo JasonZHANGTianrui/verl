@@ -65,6 +65,10 @@ def training_tasks(rows, rule):
         raise ValueError("未知动作奖励版本")
     registry = default_registry()
     for row in selected:
+        if row.get("schema") == "physical-ai.generated-rl-task.v1":
+            from .generated_tasks import validate_task
+
+            validate_task(row)
         registry.validate(row["followup"]["question_spec"])
     return selected
 
@@ -168,6 +172,15 @@ def open_task_session(task, resources, *, seed, max_steps, resolution=256):
     from benchmark.adapters import libero_env  # noqa: F401
     from libero.libero import benchmark
 
+    if task.get("schema") == "physical-ai.generated-rl-task.v1":
+        from .generated_tasks import GeneratedSession
+
+        if resolution != 256:
+            raise ValueError("生成来源固定256相机，不能私自改分辨率")
+        output = task.get("_runtime_output")
+        if output is None:
+            raise ValueError("生成任务需要本次私有执行目录")
+        return GeneratedSession(task, resources, output, max_steps)
     initial = load_initial(task, resources)
     suite_name = task["environment"]["suite"]
     suite = benchmark.get_benchmark_dict()[suite_name]()
@@ -233,11 +246,13 @@ def create_scene_capture(session, task, resources, output, *, rollout_id):
 
     if not isinstance(rollout_id, str) or not rollout_id:
         raise ValueError("需要真实rollout身份")
+    if task.get("schema") == "physical-ai.generated-rl-task.v1":
+        from .generated_tasks import GeneratedCapture
+
+        return GeneratedCapture(session, task, output, rollout_id)
     online = task.get("online_execution", {})
     expected = json.loads(
-        resolve_resource(
-            online.get("scene_config_ref", task["environment"]["scene_config_ref"]), resources
-        ).read_text()
+        resolve_resource(online.get("scene_config_ref", task["environment"]["scene_config_ref"]), resources).read_text()
     )
     initial = session.settings["initial_condition"]
     capture = SceneCapture(

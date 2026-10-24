@@ -367,3 +367,16 @@ batch128/mini32仍为真实采样槽位；`sampled`保留所有阶段生成token
 仅允许以上两个配置变化及对应实现身份；lr/batch/n/预算/题义/模型仍须一致。
 在线源码重绑定可由同一原任务包派生，须核验双方preserved_tasks身份，不能跳过
 初态或问题检查。旧checkpoint保留原契约，新运行不伪称逐位复现旧奖励过程。
+
+### 独立生成任务与固定目标数调度
+
+`generated_tasks.py`消费`physical-ai.generated-rl-task.v1`，通过数据侧
+`generation.execution.prepare_case`恢复固定seed初态、执行一次dummy、绑定实际目标。
+生成来源是`LiberoSession`的子类，只替换环境构造；QA继承原完整fork，子容器不做dummy。
+私有目标图/构型搜索不参与执行。图读取复用`libero_evaluation.create_scene_reader`。
+正常训练启动前需资源闭包、执行代码指纹及三类消费者物理验收回执匹配。
+
+`task_sampling.py`的`fixed-goal-quota-v1`预生成任务ID表，类别内洗牌轮询；
+调度只改变抽题频率，不乘reward/loss。计划与SHA进入checkpoint契约；恢复沿原游标。
+未配置task_sampling时保持旧任务轮询原行为。每题实际预算来自生成任务声明，
+单目标300、多目标520，不再把所有libero_90都硬设为520。来源旧示范分支不变。

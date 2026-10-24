@@ -91,7 +91,11 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             rollout_id = f"execution-{i}"
             session = stack.enter_context(
                 open_task_session(
-                    task,
+                    (
+                        {**task, "_runtime_output": str(output / rollout_id / "source")}
+                        if task.get("schema") == "physical-ai.generated-rl-task.v1"
+                        else task
+                    ),
                     resources,
                     seed=config["environment_seed"],
                     max_steps=config["execution_steps"] + config["qa_steps"],

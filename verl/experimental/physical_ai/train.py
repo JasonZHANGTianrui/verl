@@ -170,6 +170,20 @@ def main():
             raise ValueError("已绑定动作奖励的训练记录不足一个batch")
         # 固定训练任务顺序只由身份与seed决定，与奖励、QA答案及SFT成败无关。
         eligible.sort(key=lambda t: hashlib.sha256(f"{config['seed']}:{t['id']}".encode()).hexdigest())
+        from .task_sampling import build_schedule
+
+        schedule = build_schedule(eligible, max_groups, config["seed"], config.get("task_sampling"))
+        eligible_by_id = {t["id"]: t for t in eligible}
+        generated_release = all(t.get("schema") == "physical-ai.generated-rl-task.v1" for t in eligible)
+        if any(t.get("schema") == "physical-ai.generated-rl-task.v1" for t in eligible) and not generated_release:
+            raise ValueError("不能混合未联合验收的初态来源")
+        generated_manifest = None
+        generated_acceptance = None
+        if generated_release:
+            from .generated_tasks import verify_acceptance, verify_release
+
+            generated_manifest = verify_release(args.task_release, ROOT)
+            generated_acceptance = verify_acceptance(args.task_release, generated_manifest)
         _, resources = load_task_release(args.task_release, eligible[0]["id"])
         from .native_runtime import identity as model_interface_identity
 
@@ -203,6 +217,11 @@ def main():
                 **{p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
             },
         )
+        if schedule is not None:
+            contract["task_schedule"] = schedule
+        if generated_manifest is not None:
+            contract["generated_source"] = generated_manifest
+            contract["generated_acceptance"] = generated_acceptance
         if config["task_rule"]["version"] == "libero-shared-at-question-delivery-v1":
             from benchmark.adapters import libero_placement, libero_success
             from benchmark.scoring import placement_success
@@ -273,6 +292,8 @@ def main():
                         migration=json.loads(args.resume_migration.read_text()) if args.resume_migration else None,
                     ),
                 )
+                if schedule is not None:
+                    save_json(args.output / "task-schedule.json", schedule)
                 tracker_config = dict(config, **{k: v for k, v in algorithm.items() if k not in config})
                 tracker_config["runtime"] = dict(
                     world_size=world,
@@ -364,11 +385,18 @@ def main():
                 if owner != rank:
                     continue
                 task_index = group_index + offset
-                task = eligible[task_index % len(eligible)]
+                task = (
+                    eligible_by_id[schedule["task_ids"][task_index]]
+                    if schedule is not None
+                    else eligible[task_index % len(eligible)]
+                )
                 run_config = deepcopy(config)
                 run_config.update(
-                    execution_steps=config.get("execution_steps_by_suite", {}).get(
-                        task["environment"]["suite"], config["execution_steps"]
+                    execution_steps=task.get(
+                        "execution_budget_steps",
+                        config.get("execution_steps_by_suite", {}).get(
+                            task["environment"]["suite"], config["execution_steps"]
+                        ),
                     ),
                     case_id=task["id"],
                     suite=task["environment"]["suite"],
@@ -414,6 +442,22 @@ def main():
             sampling_seconds = time.monotonic() - started
             prepared = strategy.prepare_batch(records, artifacts)
             batch_metrics = strategy.rollout_metrics(records, artifacts, prepared)
+            if schedule is not None:
+                from collections import Counter
+
+                end = group_index + tasks_per_batch
+                for count in (1, 2, 3):
+                    batch_metrics[f"sampling/goals_{count}/batch"] = schedule["goal_counts"][group_index:end].count(
+                        count
+                    )
+                    batch_metrics[f"sampling/goals_{count}/cumulative"] = schedule["goal_counts"][:end].count(count)
+                qa_counts = Counter(
+                    eligible_by_id[i]["followup"].get(
+                        "selection_class", eligible_by_id[i]["followup"]["question_spec"]["strategy_id"]
+                    )
+                    for i in schedule["task_ids"][:end]
+                )
+                batch_metrics.update({"sampling/qa/" + k: v for k, v in qa_counts.items()})
             validation_started = time.monotonic()
             minis = strategy.minibatch_indices(records, mini_size)
             if rank == 0:
