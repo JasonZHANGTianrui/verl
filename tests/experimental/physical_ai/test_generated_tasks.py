@@ -41,7 +41,8 @@ class GeneratedTasksTest(unittest.TestCase):
                 scopes=["single", "combination", "replacement"],
                 records=160,
                 consumer_files={
-                    n: content_hash(folder / n) for n in ["generated_tasks.py", "task_data.py", "libero_session.py"]
+                    n: content_hash(folder / n)
+                    for n in ["generated_tasks.py", "task_data.py", "libero_session.py", "numerical_entry.py"]
                 },
             )
             p = root / "consumer-acceptance.json"

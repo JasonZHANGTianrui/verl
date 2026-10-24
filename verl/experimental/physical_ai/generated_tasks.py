@@ -67,10 +67,13 @@ def verify_acceptance(release, manifest):
         raise ValueError("生成来源三类验收不完整")
     folder = Path(__file__).parent
     expected = {
-        name: content_hash(folder / name) for name in ("generated_tasks.py", "task_data.py", "libero_session.py")
+        name: content_hash(folder / name)
+        for name in ("generated_tasks.py", "task_data.py", "libero_session.py", "numerical_entry.py")
     }
     if receipt.get("consumer_files") != expected:
         raise ValueError("消费者与实际验收版本不一致")
+    if receipt.get("numerical_runtime") != json.loads(os.environ.get("PHYSICAL_AI_NUMERICS_IDENTITY", "null")):
+        raise ValueError("数值环境与消费者验收不同")
     if receipt.get("records") != manifest["records"]:
         raise ValueError("验收记录数不符")
     return receipt

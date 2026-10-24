@@ -380,3 +380,10 @@ batch128/mini32仍为真实采样槽位；`sampled`保留所有阶段生成token
 调度只改变抽题频率，不乘reward/loss。计划与SHA进入checkpoint契约；恢复沿原游标。
 未配置task_sampling时保持旧任务轮询原行为。每题实际预算来自生成任务声明，
 单目标300、多目标520，不再把所有libero_90都硬设为520。来源旧示范分支不变。
+
+新独立初态跨机器时还需保持数据侧数值库路径。`numerical_entry.py`按**文件路径**
+在导入verl/torch前分别加载NumPy与SciPy的指定OpenBLAS内核，读取DSO实际内核名
+验证后恢复环境变量。只影响本进程，不修改Conda/全局环境，不取消严格状态hash。
+RL160的数据制作机为NumPy Prescott、SciPy SkylakeX；B区默认NumPy SapphireRapids
+会产生约1e-16差异。两库分别匹配后准备身份可完全相同。启动配置/消费者验收绑定
+实际内核与库版本，不能在恢复训练时静默换回自动选择。

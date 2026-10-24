@@ -130,6 +130,9 @@ def main():
         config = runtime_config
         if config["sampling_mode"] not in {"recompute", "cached"} or config["compute_dtype"] != "float32":
             raise ValueError("此后端仅启用FP32原生重算或经完整轨迹概率核验的缓存采样")
+        numerical_runtime = json.loads(os.environ.get("PHYSICAL_AI_NUMERICS_IDENTITY", "null"))
+        if config.get("numerical_runtime") is not None and numerical_runtime != config["numerical_runtime"]:
+            raise ValueError("实际数值库环境与训练配置不同")
         strategy = resolve_algorithm(config)
         algorithm = strategy.validate_config(config)
         if config["optimizer"] not in {"sgd", "adamw"}:
@@ -217,6 +220,8 @@ def main():
                 **{p.name: content_hash(p) for p in Path(__file__).parent.glob("*.py")},
             },
         )
+        if numerical_runtime is not None:
+            contract["numerical_runtime"] = numerical_runtime
         if schedule is not None:
             contract["task_schedule"] = schedule
         if generated_manifest is not None:
