@@ -319,6 +319,26 @@ def validate_resume_contract(source, target, migration=None):
         return
     if source == target and migration is None:
         return
+    if migration is not None and migration.get("protocol_revision") == "judge-task-context-v1":
+        # 裁判只增加原公开任务以解析指代，不能借此更换题库/奖励/采样/拓扑/优化器。
+        before, after = source.get("implementation_files", {}), target.get("implementation_files", {})
+        allowed = {"online_reward.py", "pilot.py", "grpo_rollout.py", "training_state.py"}
+        changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+        expected = dict(
+            source_contract_sha256=contract_hash(source),
+            target_contract_sha256=contract_hash(target),
+            protocol_revision="judge-task-context-v1",
+            implementation_changes={name: dict(before=before.get(name), after=after.get(name)) for name in changed},
+        )
+        if (
+            migration != expected
+            or set(before) != set(after)
+            or not {"online_reward.py", "pilot.py"} <= changed <= allowed
+            or {k: v for k, v in source.items() if k != "implementation_files"}
+            != {k: v for k, v in target.items() if k != "implementation_files"}
+        ):
+            raise ValueError("裁判上下文迁移只允许绑定指定RL源码变化，其余训练契约不得改变")
+        return
     if migration is not None and migration.get("protocol_revision") == "generation-timeout-increase-v1":
         # 秒数只保护推理基础设施；显式放宽时仍保留token/动作预算、数据、奖励和完整组。
         # 精确绑定两端契约，不允许把超时恢复变成更换算法或模型的通用旁路。

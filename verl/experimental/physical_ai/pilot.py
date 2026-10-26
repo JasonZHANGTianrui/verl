@@ -177,7 +177,9 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 if task
                 else None
             )
-            binding = bind_delivery(question, recorder, config["entity_names"], rollout_id)
+            binding = bind_delivery(
+                question, recorder, config["entity_names"], rollout_id, task_instruction=session.task
+            )
             private_history = recorder.export()
             save_json(directory / "delivery.json", private_history["questions"][question["question_id"]])
             save_json(directory / "scene-map.json", private_history)

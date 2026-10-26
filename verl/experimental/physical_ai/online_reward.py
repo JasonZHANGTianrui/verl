@@ -15,6 +15,7 @@
 """从同次交付快照计算GT并调用既有文本judge；评分数据不进入模型会话。"""
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -44,11 +45,13 @@ def qa_reward_status(binding, policy="stop"):
     raise ValueError("选定父经历GT不可评分，禁止重选父轨迹或填零：" + str(binding["gt"].get("reason")))
 
 
-def bind_delivery(question, recorder, names, rollout_id):
+def bind_delivery(question, recorder, names, rollout_id, *, task_instruction=None):
     """在真实追问交付处冻结GT与来源身份；后续分支动作不得改写该绑定。
 
     question为采样前固定题义，不含标准答案；recorder属于实际父轨迹。返回私有数据，
     包含绑定hash以拒绝把别的轨迹、题目或快照冒充本题GT。unknown原样保留。
+    task_instruction可选，必须为本会话实际公开的动作指令；只供裁判解析角色指代，
+    一并纳入绑定hash，不从回答推断别名，也不把原任务目标作为执行结果。
     """
     snapshot = recorder.freeze(question["question_id"])
     gt = default_registry().pop(
@@ -61,6 +64,10 @@ def bind_delivery(question, recorder, names, rollout_id):
         ),
     )
     payload = dict(rollout_id=rollout_id, question=deepcopy(question), gt=gt)
+    if task_instruction is not None:
+        if not isinstance(task_instruction, str) or not task_instruction.strip():
+            raise ValueError("裁判任务上下文须为本回合已交付的非空原指令")
+        payload["task_instruction"] = task_instruction
     payload["binding_sha256"] = hashlib.sha256(canonical(payload).encode()).hexdigest()
     return payload
 
@@ -88,7 +95,8 @@ def score_answer(binding, answer, transport, *, rollout_id, max_attempts=20):
     只重试相同答案，不重新生成或重跑机器人；有效0分不重试，没有格式/长度奖励。
     """
     payload = {k: deepcopy(v) for k, v in binding.items() if k != "binding_sha256"}
-    if set(binding) != {"rollout_id", "question", "gt", "binding_sha256"}:
+    fields = {"rollout_id", "question", "gt", "binding_sha256"}
+    if set(binding) not in (fields, fields | {"task_instruction"}):
         raise ValueError("评分绑定字段不完整")
     if (
         binding["rollout_id"] != rollout_id
@@ -96,10 +104,14 @@ def score_answer(binding, answer, transport, *, rollout_id, max_attempts=20):
     ):
         raise ValueError("评分绑定被改动或属于其他轨迹")
     calls = 0
+    sent_messages = None
+    instruction = binding.get("task_instruction")
+    if "task_instruction" in binding and (not isinstance(instruction, str) or not instruction.strip()):
+        raise ValueError("裁判任务上下文无效")
 
     def retry_transport(messages):
         """仅在裁判已要求下一次重试时等待；不消耗策略随机数或改写消息。"""
-        nonlocal calls
+        nonlocal calls, sent_messages
         if calls:
             delay = min(5 * 2 ** min(calls - 1, 4), 60)
             logging.getLogger(__name__).warning(
@@ -112,9 +124,30 @@ def score_answer(binding, answer, transport, *, rollout_id, max_attempts=20):
             )
             time.sleep(delay)
         calls += 1
-        return transport(messages)
+        sent_messages = deepcopy(messages)
+        if instruction is not None:
+            # 只补已公开任务，不向裁判提供策略未见的历史，不把目标当成成功事实。
+            sent_messages[0]["content"] += (
+                "\nUse task_instruction only to resolve entity references. "
+                "Requested actions are not evidence that they occurred; score actual facts using ground_truth."
+            )
+            content = json.loads(sent_messages[1]["content"])
+            content["task_instruction"] = instruction
+            sent_messages[1]["content"] = json.dumps(content, ensure_ascii=False)
+        return transport(sent_messages)
 
     result = judge_answer(binding["question"], binding["gt"], answer, retry_transport, max_attempts=max_attempts)
+    if instruction is not None:
+        result["judge_context_version"] = "task-instruction-reference-v1"
+        result["task_instruction_sha256"] = hashlib.sha256(instruction.encode()).hexdigest()
+        if sent_messages is not None:
+            # 保存真正发给API的请求，不能沿用共享judge构造的未补上下文输入hash。
+            result["input"] = json.loads(sent_messages[1]["content"])
+            result["input_sha256"] = hashlib.sha256(
+                json.dumps(sent_messages, ensure_ascii=False, sort_keys=True).encode()
+            ).hexdigest()
+            result["rubric_version"] += "+task-context-v1"
+            result["rubric_sha256"] = hashlib.sha256(sent_messages[0]["content"].encode()).hexdigest()
     result["retry_policy"] = dict(max_attempts=max_attempts, initial_delay_seconds=5, max_delay_seconds=60)
     return dict(
         result,

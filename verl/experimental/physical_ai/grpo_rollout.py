@@ -101,7 +101,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 task, config["task_rule"], session, reader, recorder, execution["termination"]
             )
             binding = (
-                bind_delivery(question, recorder, config["entity_names"], identity)
+                bind_delivery(question, recorder, config["entity_names"], identity, task_instruction=session.task)
                 if question is not None and not execution.get("incomplete_message")
                 else None
             )

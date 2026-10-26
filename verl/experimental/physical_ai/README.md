@@ -399,3 +399,14 @@ QA fork在严格核对物理、模型和渲染变换后，使用`verify_fork_ren
 模型＋优化器＋游标/RNG恢复点；`max_ckpt_to_keep=1`仅保留最新完整恢复点。
 例如`save_freq=20,recovery_save_freq=5`在5/10/15批有恢复点，20批另保留纯模型。
 未配置新字段保持原行为；奖励、采样和更新次数不因保存频率改变。
+
+### 裁判的任务指代上下文（2026-10-26）
+
+动作→QA交付绑定可携带本回合实际`task_instruction`，与原题/GT/父轨迹一起hash。
+SegGRPO及普通GRPO均取原session.task；只发送给judge解析目标/另一物体等指代，
+不改模型消息、GT或奖励。请求明确任务意图不是事实。结果保存实际发送的input、
+rubric和hash，旧无上下文绑定保持兼容。needs_review仍不能填0或反复请求凑分。
+
+从旧完整checkpoint接续须显式`judge-task-context-v1`迁移，精确绑定两端契约及
+online_reward/pilot/grpo_rollout/training_state源码差异；其余数据、配置、卡数、
+源权重和调度完全一致。优化器/RNG/完成组数正常恢复；不改旧分数和旧checkpoint。

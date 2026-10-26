@@ -128,6 +128,48 @@ def _reshard_adam_worker(rank, directory):
 class TrainingStateTests(unittest.TestCase):
     """用有动量的小模型核对真实优化器恢复，不用无状态SGD掩盖漏存状态。"""
 
+    def test_judge_context_migration_cannot_change_training(self):
+        """显式裁判修复迁移只改指定源码；数据/奖励/学习率/调度和其他实现变化都拒绝。"""
+        from copy import deepcopy
+
+        source = dict(
+            config={"learning_rate": 1e-6},
+            world_size=8,
+            tasks_sha256="tasks",
+            task_schedule={"ids": ["a"]},
+            implementation_files={
+                n: "old" for n in ["online_reward.py", "pilot.py", "grpo_rollout.py", "training_state.py", "seggrpo.py"]
+            },
+        )
+        target = deepcopy(source)
+        for n in ["online_reward.py", "pilot.py", "grpo_rollout.py", "training_state.py"]:
+            target["implementation_files"][n] = "new"
+
+        def receipt(t):
+            """绑定完整两端hash及明确文件差异，不接受仅有协议名的迁移。"""
+            return dict(
+                source_contract_sha256=contract_hash(source),
+                target_contract_sha256=contract_hash(t),
+                protocol_revision="judge-task-context-v1",
+                implementation_changes={
+                    n: dict(before=source["implementation_files"].get(n), after=t["implementation_files"].get(n))
+                    for n in source["implementation_files"].keys() | t["implementation_files"].keys()
+                    if source["implementation_files"].get(n) != t["implementation_files"].get(n)
+                },
+            )
+
+        validate_resume_contract(source, target, receipt(target))
+        for key in ["config", "world_size", "tasks_sha256", "task_schedule", "implementation_files"]:
+            bad = deepcopy(target)
+            if key == "implementation_files":
+                bad[key]["seggrpo.py"] = "changed"
+            else:
+                bad[key] = "changed"
+            with self.assertRaises(ValueError):
+                validate_resume_contract(source, bad, receipt(bad))
+        with self.assertRaises(ValueError):
+            validate_resume_contract(source, target, None)
+
     def test_recovery_and_model_checkpoint_frequencies(self):
         """恢复每5批而测评每20批；未配置仍保持旧频率，末批两种都保存。"""
         self.assertEqual(checkpoint_plan(5, 20, 5), (True, False))

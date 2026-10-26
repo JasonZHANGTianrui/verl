@@ -254,6 +254,39 @@ class OnlineRewardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             score_answer(bad, "No.", forbidden, rollout_id="parent-a")
 
+    def test_task_context_is_bound_and_actual_request_is_audited(self):
+        """原任务只进裁判，GT/回答不变；篡改指令拒绝，审计hash对应实际发送消息。"""
+        from copy import deepcopy
+
+        value = binding()
+        value["task_instruction"] = "Open the drawer."
+        value["binding_sha256"] = hashlib.sha256(
+            canonical({k: v for k, v in value.items() if k != "binding_sha256"}).encode()
+        ).hexdigest()
+        before = deepcopy(value)
+        seen = []
+
+        def transport(messages):
+            """模拟按真实GT拒绝把动作意图当成完成结果。"""
+            seen.append(deepcopy(messages))
+            return {"raw_response": json.dumps(dict(status="scored", score=0, reason="GT is closed."))}
+
+        result = score_answer(value, "Yes.", transport, rollout_id="parent-a")
+        sent = json.loads(seen[0][1]["content"])
+        self.assertEqual(sent["task_instruction"], "Open the drawer.")
+        self.assertIs(sent["ground_truth"]["value"], False)
+        self.assertEqual(sent["model_response"], "Yes.")
+        self.assertEqual(result["input"], sent)
+        self.assertEqual(
+            result["input_sha256"],
+            hashlib.sha256(json.dumps(seen[0], ensure_ascii=False, sort_keys=True).encode()).hexdigest(),
+        )
+        self.assertEqual(value, before)
+        value["task_instruction"] = "Close the drawer."
+        with self.assertRaises(ValueError):
+            score_answer(value, "Yes.", transport, rollout_id="parent-a")
+        self.assertEqual(len(seen), 1)
+
     def test_api_error_is_not_zero_and_same_answer_is_retried(self):
         """重试判分而非重试模型，保留None奖励用于组级恢复。"""
         seen = []
