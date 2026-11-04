@@ -206,7 +206,11 @@ def phase_steps(
                 timings["environment_step_seconds"] += time.perf_counter() - started
                 session.steps += 1
                 session.last_action = action.copy()
-                session.action_history.append(dict(step=session.steps, mode=mode, action=action.tolist()))
+                row = dict(step=session.steps, mode=mode, action=action.tolist())
+                if getattr(session, "record_replay_spans", False):
+                    # 连续两个hold段也必须分别进入原目标保持上下文，不能只按mode合并。
+                    row["replay_span"] = [len(traces), request_index, segment_index]  # noqa: B023
+                session.action_history.append(row)
                 # GS-10：共同任务判据每真实控制步读取；只记私有状态，不提前停或补动作。
                 monitor = getattr(session, "success_monitor", None)
                 if monitor is not None:

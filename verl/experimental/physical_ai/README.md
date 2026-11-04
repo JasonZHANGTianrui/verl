@@ -410,3 +410,17 @@ rubric和hash，旧无上下文绑定保持兼容。needs_review仍不能填0或
 从旧完整checkpoint接续须显式`judge-task-context-v1`迁移，精确绑定两端契约及
 online_reward/pilot/grpo_rollout/training_state源码差异；其余数据、配置、卡数、
 源权重和调度完全一致。优化器/RNG/完成组数正常恢复；不改旧分数和旧checkpoint。
+
+### Previous-batch QA ablation
+
+`qa_history_mode: previous_batch` is an explicit SegGRPO-only option; the default
+`current` keeps the original online parent selection. The first sampling batch
+uses its current parent, then each QA group continues the preceding batch's same
+slot, with its original question, complete native prefix and delivery GT. New QA
+tokens are sampled with the current policy; old action tokens receive no new loss.
+`history-parent/manifest.json` binds immutable native tensors, actual controls and
+source policy. Recovery replays those controls with original hold boundaries and
+verifies preparation, controller/sensor/physical state, images and GT before QA.
+The checkpoint's previous-batch directory must remain available for resuming.
+The history distribution is stale; this is not stale-answer PPO. Histories and
+current optimizer grouping have separate identities. Ordinary GRPO is unchanged.

@@ -61,6 +61,11 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     )
 
     question = config["question"]
+    history_mode = config.get("qa_history_mode", "current")
+    if history_mode not in {"current", "previous_batch"}:
+        raise ValueError("未知QA经历来源")
+    if history_mode == "previous_batch" and (task is None or task.get("schema") == "physical-ai.generated-rl-task.v1"):
+        raise ValueError("旧经历QA首版仅支持已核验的普通LIBERO示范初态任务")
     if type(config.get("thinking", False)) is not bool:
         raise ValueError("thinking须为显式布尔值")
     task_index = None
@@ -106,6 +111,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     max_steps=config["execution_steps"] + config["qa_steps"],
                 )
             )
+            session.record_replay_spans = history_mode == "previous_batch"
             capture = (
                 create_scene_capture(session, task, resources, output / "scene" / rollout_id, rollout_id=rollout_id)
                 if task is not None
@@ -231,11 +237,46 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
         selected = select_parent(records, seed=config["seed"], mode="uniform")
         parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
         session, chat, phase, binding = parents[parent_index]
+        history_parent = None
+        parent_reward = records[parent_index].reward
+        qa_case_id = config["case_id"]
+        if history_mode == "previous_batch":
+            from .history_replay import restore_parent, save_parent
+
+            save_parent(
+                output / "history-parent",
+                session,
+                chat,
+                phase,
+                binding,
+                config=config,
+                task=task,
+                selected=selected,
+                reward=parent_reward,
+                policy_version=policy_version,
+            )
+            if config.get("qa_history_input") is not None:
+                # 当前父经历已经不可变落盘；QA使用上一批自己的场景/问题/GT，绝不混接。
+                restored = restore_parent(
+                    Path(config["qa_history_input"]),
+                    output / "history-replay",
+                    policy,
+                    processor,
+                    resources,
+                    current_config=config,
+                )
+                session = stack.enter_context(restored["session"])
+                chat, phase, binding = (restored[k] for k in ("chat", "phase", "binding"))
+                question = restored["question"]
+                selected = restored["history_parent"]["rollout_id"]
+                qa_case_id = restored["history_parent"]["case_id"]
+                history_parent = restored["history_parent"]
+                parent_reward = restored["reward"]
         reward_status = qa_reward_status(binding, config.get("unknown_qa_policy", "stop"))
         # 未选中的真实轨迹/GT已经落盘，之后不再执行这些环境；及时释放其EGL资源。
         # 只关闭环境，不删除原会话/动作记录，也不按奖励改变父轨迹选择。
         for index, parent in enumerate(parents):
-            if index != parent_index:
+            if index != parent_index or history_parent is not None:
                 parent[0].close()
         # 渲染器的显存不归PyTorch allocator管理；归还空闲块供接下来的QA副本使用。
         import gc
@@ -252,7 +293,9 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
             output / "selection.json",
             dict(
                 parent_rollout_id=selected,
-                parent_reward=records[parent_index].reward,
+                parent_reward=parent_reward,
+                history_parent=history_parent,
+                history_mode=history_mode,
                 selection="uniform",
                 seed=config["seed"],
                 prefix_sha256=prefix_hash,
@@ -290,7 +333,9 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     max_calls=config.get("qa_max_calls"),
                     timeout_seconds=config.get("generation_timeout_seconds", 180),
                 )
-                judgment = score_answer(binding, answer["answer"], client, rollout_id=selected)
+                judgment = score_answer(
+                    binding, answer["answer"], client, rollout_id=restored["selected"] if history_parent else selected
+                )
                 save_json(directory / "judge.json", judgment)
                 if reward_status == "scored" and judgment["status"] != "scored":
                     raise ValueError("judge未给有效分数，整个组保留待恢复，禁止更新")
@@ -301,7 +346,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     "qa",
                     "qa-group",
                     qa_condition,
-                    config["case_id"],
+                    qa_case_id,
                     policy_version,
                     config["qa_group_size"],
                     answer["prefix_length"] - 1,
@@ -309,6 +354,8 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     float(judgment["score"]) if reward_status == "scored" else None,
                     reward_status,
                     parent_rollout_id=selected,
+                    history_parent=history_parent,
+                    paired_execution_group_id="execution-group" if history_parent else None,
                 )
                 answer["inputs_path"] = str(directory / "inputs.pt")
                 finished_qa += 1

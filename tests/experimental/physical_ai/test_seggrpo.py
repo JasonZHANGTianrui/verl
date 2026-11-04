@@ -61,6 +61,64 @@ def fixture():
 class SegGRPOTests(unittest.TestCase):
     """针对分组、反向和选择偏置测试，而不是只验证字段名字。"""
 
+    def test_previous_batch_qa_keeps_old_parent_and_masks_old_actions(self):
+        """旧QA可属于另一任务，但不能冒充当前父轨迹或再次监督历史动作。"""
+        records, mask = fixture()
+        history = dict(
+            rollout_id="previous/task/a0",
+            case_id="previous-case",
+            policy_version="model/update-0",
+            manifest_sha256="a" * 64,
+            source_batch=0,
+            current_batch=1,
+        )
+        records = [replace(r, policy_version="model/update-4") for r in records]
+        records = [
+            replace(
+                r,
+                case_id="previous-case",
+                parent_rollout_id=history["rollout_id"],
+                history_parent=history,
+                paired_execution_group_id="action-group",
+            )
+            if r.phase == "qa"
+            else r
+            for r in records
+        ]
+        namespaced = namespace_group(records, "current-task")
+        self.assertEqual(namespaced[2].parent_rollout_id, "previous/task/a0")
+        self.assertEqual(namespaced[2].paired_execution_group_id, "current-task/action-group")
+        artifacts = [dict(generated=[False] + m.tolist(), old_logprobs=[0.0] + [-1.0] * len(m)) for m in mask]
+        prepared = prepare_batch(namespaced, artifacts)
+        self.assertFalse(bool(prepared["active"][2:, :4].any()))
+        self.assertTrue(bool(prepared["active"][:2, :4].any()))
+        self.assertEqual(minibatch_indices(namespaced, 4), [[0, 1, 2, 3]])
+        metrics = rollout_metrics(namespaced, artifacts, prepared)
+        self.assertEqual(metrics["rollout/qa/history_update_age_mean"], 4)
+        for changed in [dict(case_id="wrong"), dict(current_batch=3), dict(manifest_sha256="bad")]:
+            corrupt = [replace(r, history_parent={**history, **changed}) if r.phase == "qa" else r for r in records]
+            with self.assertRaises(ValueError):
+                prepare_batch(corrupt, artifacts)
+
+    def test_history_restore_uses_last_complete_checkpoint_batch(self):
+        """从恢复点之后继续时只读旧run上一批，不误取新run半成品。"""
+        import tempfile
+        from pathlib import Path
+
+        from verl.experimental.physical_ai.history_replay import history_input_path
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / "old/batch-000004/task-000032/history-parent"
+            parent.mkdir(parents=True)
+            (parent / "manifest.json").write_text("{}")
+            self.assertIsNone(history_input_path(root / "new", None, 0, task_index=0, tasks_per_batch=8))
+            self.assertEqual(
+                history_input_path(root / "new", root / "old", 40, task_index=40, tasks_per_batch=8), str(parent)
+            )
+            with self.assertRaises(FileNotFoundError):
+                history_input_path(root / "new", root / "old", 40, task_index=48, tasks_per_batch=8)
+
     def test_unknown_qa_is_null_and_has_no_gradient_without_diluting_valid_groups(self):
         """保留完整QA槽位和采样记录；其null奖励不稀释其他QA，动作梯度不变。"""
         base, mask = fixture()

@@ -29,7 +29,14 @@ def namespace_group(records, prefix):
             r,
             rollout_id=prefix + "/" + r.rollout_id,
             group_id=prefix + "/" + r.group_id,
-            parent_rollout_id=prefix + "/" + r.parent_rollout_id if r.parent_rollout_id else None,
+            parent_rollout_id=(
+                r.parent_rollout_id if r.history_parent is not None else prefix + "/" + r.parent_rollout_id
+            )
+            if r.parent_rollout_id
+            else None,
+            paired_execution_group_id=prefix + "/" + r.paired_execution_group_id
+            if r.paired_execution_group_id
+            else None,
         )
         for r in records
     ]
@@ -48,7 +55,9 @@ def task_groups(records):
     for ids in groups.values():
         r = records[ids[0]]
         if r.phase == "qa":
-            parent = by_id[r.parent_rollout_id].group_id
+            parent = (
+                r.paired_execution_group_id if r.history_parent is not None else by_id[r.parent_rollout_id].group_id
+            )
             if parent in attached:
                 raise ValueError("同一动作组不能重复附加QA组")
             pairs[parent].extend(ids)

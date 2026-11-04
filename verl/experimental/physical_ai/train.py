@@ -273,6 +273,7 @@ def main():
         if task_rebind:
             contract["task_rebind"] = task_rebind
         checkpoint, completed, updates, restored = args.checkpoint, 0, 0, None
+        history_resume_root = None
         if args.resume:
             restored, receipt = load_boundary(
                 args.resume,
@@ -280,6 +281,7 @@ def main():
                 migration=json.loads(args.resume_migration.read_text()) if args.resume_migration else None,
             )
             checkpoint = Path(receipt["path"])
+            history_resume_root = checkpoint.parents[2]
             completed, updates = restored["completed_groups"], restored["optimizer_steps"]
         startup = None
         if rank == 0:
@@ -411,6 +413,17 @@ def main():
                     entity_names=task["followup"]["entity_names"],
                     seed=config["seed"] + task_index * 1000,
                 )
+                if config.get("qa_history_mode", "current") == "previous_batch":
+                    from .history_replay import history_input_path
+
+                    run_config["sampling_batch_index"] = batch_index
+                    run_config["qa_history_input"] = history_input_path(
+                        args.output,
+                        history_resume_root,
+                        completed,
+                        task_index=task_index,
+                        tasks_per_batch=tasks_per_batch,
+                    )
                 task_dir = directory / f"task-{task_index:06d}"
                 task_dir.mkdir()
                 save_json(task_dir / "task.json", task)

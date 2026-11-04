@@ -70,6 +70,11 @@ def validate_fixed_algorithm(config):
     if policy not in {"stop", "retain_action_skip_qa_group"}:
         raise ValueError("未知QA组处理策略")
     fixed["unknown_qa_policy"] = policy
+    history_mode = config.get("qa_history_mode", "current")
+    if history_mode not in {"current", "previous_batch"}:
+        raise ValueError("未知QA经历来源")
+    if history_mode != "current":
+        fixed["qa_history_mode"] = history_mode
     return fixed
 
 

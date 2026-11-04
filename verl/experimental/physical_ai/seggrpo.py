@@ -49,6 +49,9 @@ class Segment:
     reward: float | None
     reward_status: str
     parent_rollout_id: str | None = None
+    # 仅滞后QA使用：旧父经历身份与当前计算batch配对分别记录，不伪称来自当前动作组。
+    history_parent: dict | None = None
+    paired_execution_group_id: str | None = None
 
 
 def validate_groups(records):
@@ -99,6 +102,8 @@ def validate_groups(records):
                 records[i].group_size,
                 records[i].parent_rollout_id,
                 records[i].reward_status,
+                json.dumps(records[i].history_parent, sort_keys=True),
+                records[i].paired_execution_group_id,
             )
             for i in indices
         }
@@ -107,13 +112,62 @@ def validate_groups(records):
     qa_groups = defaultdict(set)
     for record in records:
         if record.phase == "execution":
-            if record.parent_rollout_id is not None:
+            if (
+                record.parent_rollout_id is not None
+                or record.history_parent is not None
+                or record.paired_execution_group_id is not None
+            ):
                 raise ValueError("动作阶段不能有QA父轨迹")
         else:
-            parent = ids.get(record.parent_rollout_id)
-            if parent is None or parent.phase != "execution" or parent.case_id != record.case_id:
-                raise ValueError("QA未绑定本批同case的真实动作父轨迹")
-            qa_groups[parent.group_id].add(record.group_id)
+            if record.history_parent is not None:
+                history = record.history_parent
+                required = {
+                    "rollout_id",
+                    "case_id",
+                    "policy_version",
+                    "manifest_sha256",
+                    "source_batch",
+                    "current_batch",
+                }
+                if set(history) != required or any(
+                    not isinstance(history[k], str) or not history[k]
+                    for k in ("rollout_id", "case_id", "policy_version", "manifest_sha256")
+                ):
+                    raise ValueError("旧父经历缺少完整来源身份")
+                if len(history["manifest_sha256"]) != 64 or any(
+                    c not in "0123456789abcdef" for c in history["manifest_sha256"]
+                ):
+                    raise ValueError("旧父经历摘要无效")
+                if (
+                    any(type(history[k]) is not int for k in ("source_batch", "current_batch"))
+                    or history["source_batch"] < 0
+                    or history["current_batch"] != history["source_batch"] + 1
+                ):
+                    raise ValueError("旧经历须恰好来自上一采样批")
+                if (
+                    history["case_id"] != record.case_id
+                    or history["rollout_id"] != record.parent_rollout_id
+                    or record.parent_rollout_id in ids
+                ):
+                    raise ValueError("旧QA的case/父身份与来源不一致")
+                try:
+                    old_source, old_step = history["policy_version"].rsplit("/update-", 1)
+                    new_source, new_step = record.policy_version.rsplit("/update-", 1)
+                    if old_source != new_source or not 0 <= int(old_step) <= int(new_step):
+                        raise ValueError("旧经历来自另一初始化或未来策略")
+                except (ValueError, TypeError) as exc:
+                    raise ValueError("旧经历策略版本不能与当前行为策略对齐") from exc
+                pair = record.paired_execution_group_id
+                if pair not in groups or records[groups[pair][0]].phase != "execution":
+                    raise ValueError("旧QA缺少当前计算batch的配对动作组")
+                qa_groups[pair].add(record.group_id)
+            else:
+                if record.paired_execution_group_id is not None:
+                    raise ValueError("普通QA不能声明历史配对")
+                parent = ids.get(record.parent_rollout_id)
+                if parent is None or parent.phase != "execution" or parent.case_id != record.case_id:
+                    raise ValueError("QA未绑定本批同case的真实动作父轨迹")
+                qa_groups[parent.group_id].add(record.group_id)
     if any(len(value) != 1 for value in qa_groups.values()):
         raise ValueError("当前方案每个动作组只允许一个QA父轨迹/分支组")
     return dict(groups)
@@ -218,6 +272,7 @@ def segmented_policy_loss(
         execution_groups = {r.group_id for r in records if r.phase == "execution"}
         parents = {r.parent_rollout_id for r in records if r.phase == "qa"}
         covered = {r.group_id for r in records if r.rollout_id in parents}
+        covered.update(r.paired_execution_group_id for r in records if r.history_parent is not None)
         if covered != execution_groups:
             raise ValueError("启用QA时每个动作组都须有对应QA组；缺分组不能静默丢弃")
     by_phase = defaultdict(list)
