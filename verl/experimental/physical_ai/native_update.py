@@ -122,6 +122,26 @@ def update_once(
             )
             n = inputs["input_ids"].shape[1] - 1
             mask = active[i : i + 1, :n].cuda()
+            if artifact.get("context_window") is not None:
+                from .image_context import backward_window_trajectory
+
+                metrics = backward_window_trajectory(
+                    model,
+                    inputs,
+                    artifact,
+                    old[i : i + 1, :n].cuda(),
+                    advantages[i : i + 1, :n].cuda(),
+                    mask,
+                    phase_size=phase_sizes[record.phase],
+                    config=config,
+                    compute_dtype=compute_dtype,
+                    enforce_on_policy=enforce_on_policy,
+                    max_error=max_logprob_error,
+                )
+                rows.append(dict(rollout_id=record.rollout_id, phase=record.phase, **metrics))
+                save_json(Path(output) / "update-progress.json", dict(finished=len(rows), rows=rows))
+                del inputs, mask
+                continue
             ids_mask = torch.cat((torch.zeros((1, 1), dtype=torch.bool, device="cuda"), mask), 1)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=compute_dtype == "bfloat16"):
                 hidden = no_cache_hidden(model, inputs)
@@ -242,6 +262,16 @@ def validate_behavior(
             )
             n = inputs["input_ids"].shape[1] - 1
             mask = prepared.get("sampled", prepared["active"])[i : i + 1, :n].cuda()
+            if artifact.get("context_window") is not None:
+                from .image_context import validate_window_behavior
+
+                metrics = validate_window_behavior(
+                    model, inputs, artifact, prepared["old"][i : i + 1, :n].cuda(), mask, max_error
+                )
+                rows.append(dict(rollout_id=record.rollout_id, **metrics))
+                save_json(Path(output) / f"behavior-rank-{rank}.json", dict(finished=len(rows), rows=rows))
+                del inputs, mask
+                continue
             ids_mask = torch.cat((torch.zeros((1, 1), dtype=torch.bool, device="cuda"), mask), 1)
             hidden = no_cache_hidden(model, inputs)
             logp = next_token_logprobs(hidden, inputs["input_ids"], ids_mask, model.vlm.decode)

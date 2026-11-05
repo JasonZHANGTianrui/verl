@@ -57,6 +57,8 @@ def phase_steps(
     per_message_budget=False,
     timeout_seconds=120,
     allow_budget_truncation=False,
+    abort_on_generation_timeout=False,
+    max_image_turn=None,
 ):
     """采集一个阶段并保存全部原始生成ID与概率，工具观察不标成策略输出。
 
@@ -66,7 +68,8 @@ def phase_steps(
     每个模型调用以yield交给调度器，收到原token/概率后继续实际执行；多个generator
     可在同一owner线程交错运行，使独立会话的生成请求形成GPU batch。
     默认仍拒绝未完成消息。普通GRPO可显式保留token/context预算截断的原token，
-    不补EOS、不执行其中工具，由上层结束整条经历；基础设施超时继续抛错。
+    不补EOS、不执行其中工具，由上层结束整条经历。Mem可显式将采样器返回的
+    wall_time_limit也作为单条截断；真正的CUDA、环境和GT异常不在此捕获。
     """
     import imageio.v2 as imageio
     from experiments.libero.libero_eval_utils import (
@@ -96,6 +99,11 @@ def phase_steps(
     before_steps = session.steps
     history_start = len(session.action_history)
     engine = cached_session(chat.policy.model)
+    window = None
+    if max_image_turn is not None:
+        from .image_context import SamplingWindow
+
+        window = SamplingWindow(max_image_turn, chat.tokenizer)
     rng = torch.Generator(device="cuda").manual_seed(seed)
     eos = chat.tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
     stop_ids = [eos, chat.policy.model.cfg.eos_token_id]
@@ -115,9 +123,12 @@ def phase_steps(
             and (max_calls is None or len(traces) < max_calls)
         ):
             inputs = to_device(chat.inputs(), torch.device("cuda"))
+            visual_history = None
+            if window is not None:
+                inputs, engine, visual_history = window.project(inputs, engine, cached_session)
             budget = min(
                 token_budget if per_message_budget else token_budget - consumed,
-                int(engine.model.cfg.vlm.max_position_embeddings) - len(chat.ids),
+                int(engine.model.cfg.vlm.max_position_embeddings) - inputs["input_ids"].shape[1],
             )
             if budget < 1:
                 if allow_budget_truncation:
@@ -141,7 +152,12 @@ def phase_steps(
             trace = dict(
                 phase=phase,
                 start_step=session.steps,
-                input_tokens=len(chat.ids),
+                input_tokens=inputs["input_ids"].shape[1],
+                **(
+                    dict(original_input_tokens=len(chat.ids), visual_history=visual_history)
+                    if window is not None
+                    else {}
+                ),
                 text=text,
                 exact_stop_token_id=ids[-1] if ids else None,
                 exact_stop_kind=(
@@ -156,6 +172,7 @@ def phase_steps(
             save_json(directory / f"call-{len(traces):03d}.json", trace)
             traces.append(trace)
             truncated = allow_budget_truncation and response["termination"] in {"token_budget", "context_capacity"}
+            truncated = truncated or (abort_on_generation_timeout and response["termination"] == "wall_time_limit")
             if response["termination"] != "message_end" and not truncated:
                 raise RuntimeError("unsupported_incomplete_message:" + response["termination"])
             chat.append_generated(ids)
@@ -261,8 +278,10 @@ def phase_steps(
             timings=timings,
             render_backend=session.render_backend,
         )
-        if allow_budget_truncation:
+        if allow_budget_truncation or abort_on_generation_timeout:
             result["incomplete_message"] = incomplete_message
+        if window is not None:
+            result["context_window"] = window.certificate(chat.inputs(), traces)
         save_json(
             directory / "controls.json",
             dict(

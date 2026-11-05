@@ -96,6 +96,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 per_message_budget=config.get("execution_token_scope") == "message",
                 timeout_seconds=config["generation_timeout_seconds"],
                 allow_budget_truncation=True,
+                max_image_turn=config.get("max_image_turn"),
             )
             task_result = task_reward_at_delivery(
                 task, config["task_rule"], session, reader, recorder, execution["termination"]
@@ -119,7 +120,15 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 # fork_chat仅复制同一条轨迹的原会话用于容量预检；不新建环境或另选父经历。
                 candidate = fork_chat(chat)
                 candidate.question(question["question"], pending_assistant=execution["pending_assistant"])
-                if len(candidate.ids) >= int(policy.model.cfg.vlm.max_position_embeddings):
+                candidate_length = len(candidate.ids)
+                if config.get("max_image_turn") is not None:
+                    from image_window import half_window_inputs
+
+                    actual, _ = half_window_inputs(
+                        candidate.inputs(), candidate.tokenizer, max_image_turn=config["max_image_turn"]
+                    )
+                    candidate_length = actual["input_ids"].shape[1]
+                if candidate_length >= int(policy.model.cfg.vlm.max_position_embeddings):
                     status = "context_capacity"
                 else:
                     answer = yield from phase_steps(
@@ -135,6 +144,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                         max_calls=config.get("qa_max_calls"),
                         timeout_seconds=config["generation_timeout_seconds"],
                         allow_budget_truncation=True,
+                        max_image_turn=config.get("max_image_turn"),
                     )
                     judgment = score_answer(binding, answer["answer"], client, rollout_id=identity)
                     save_json(directory / "judge.json", judgment)
@@ -143,6 +153,12 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     qa_reward = float(judgment["score"])
                     status = "scored"
                     artifact = dict(answer)
+                    if config.get("max_image_turn") is not None:
+                        from .image_context import join_phase_windows
+
+                        artifact["context_window"] = join_phase_windows(
+                            execution["context_window"], answer["context_window"]
+                        )
                     artifact["inputs_path"] = str(directory / "qa/inputs.pt")
                     # QA采集保存完整生成mask和原概率，但其阶段边界需扩大为整条真实会话。
                     artifact["prefix_length"] = execution["prefix_length"]

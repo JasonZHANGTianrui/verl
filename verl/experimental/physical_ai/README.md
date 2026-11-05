@@ -410,3 +410,18 @@ rubric和hash，旧无上下文绑定保持兼容。needs_review仍不能填0或
 从旧完整checkpoint接续须显式`judge-task-context-v1`迁移，精确绑定两端契约及
 online_reward/pilot/grpo_rollout/training_state源码差异；其余数据、配置、卡数、
 源权重和调度完全一致。优化器/RNG/完成组数正常恢复；不改旧分数和旧checkpoint。
+
+### Ordinary GRPO with an image window
+
+Set `max_image_turn: 12` to drop the oldest six observation pairs whenever twelve
+pairs accumulate; initial observations count as one pair. Text, actions and state
+history remain. `image_context` reuses the shared SFT `image_window` projection,
+rebuilds all recurrent/attention caches after eviction, and validates likelihoods
+against the actual per-window prefixes. Default full-history behavior is unchanged.
+
+For action→QA trajectories, `grpo_rollout` joins both phase certificates before
+computing the single ordinary-GRPO objective. Every generated token is supervised
+once, and each window's loss is weighted by its token count over the complete
+trajectory. Using only the final QA window would silently discard action training
+and is rejected by coverage validation. Task-only trajectories retain the action
+certificate. QA capacity checks use the projected input, not the archived full log.
