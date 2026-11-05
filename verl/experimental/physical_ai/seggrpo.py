@@ -121,42 +121,65 @@ def validate_groups(records):
         else:
             if record.history_parent is not None:
                 history = record.history_parent
-                required = {
-                    "rollout_id",
-                    "case_id",
-                    "policy_version",
-                    "manifest_sha256",
-                    "source_batch",
-                    "current_batch",
-                }
-                if set(history) != required or any(
-                    not isinstance(history[k], str) or not history[k]
-                    for k in ("rollout_id", "case_id", "policy_version", "manifest_sha256")
-                ):
-                    raise ValueError("旧父经历缺少完整来源身份")
-                if len(history["manifest_sha256"]) != 64 or any(
-                    c not in "0123456789abcdef" for c in history["manifest_sha256"]
-                ):
-                    raise ValueError("旧父经历摘要无效")
-                if (
-                    any(type(history[k]) is not int for k in ("source_batch", "current_batch"))
-                    or history["source_batch"] < 0
-                    or history["current_batch"] != history["source_batch"] + 1
-                ):
-                    raise ValueError("旧经历须恰好来自上一采样批")
-                if (
-                    history["case_id"] != record.case_id
-                    or history["rollout_id"] != record.parent_rollout_id
-                    or record.parent_rollout_id in ids
-                ):
-                    raise ValueError("旧QA的case/父身份与来源不一致")
-                try:
-                    old_source, old_step = history["policy_version"].rsplit("/update-", 1)
-                    new_source, new_step = record.policy_version.rsplit("/update-", 1)
-                    if old_source != new_source or not 0 <= int(old_step) <= int(new_step):
-                        raise ValueError("旧经历来自另一初始化或未来策略")
-                except (ValueError, TypeError) as exc:
-                    raise ValueError("旧经历策略版本不能与当前行为策略对齐") from exc
+                if history.get("kind") == "fixed_sft":
+                    required = {
+                        "kind",
+                        "rollout_id",
+                        "case_id",
+                        "manifest_sha256",
+                        "prefix_sha256",
+                        "source_record_sha256",
+                    }
+                    if set(history) != required or any(
+                        not isinstance(history[k], str) or not history[k] for k in required
+                    ):
+                        raise ValueError("固定SFT经历身份不完整")
+                    for key in ("manifest_sha256", "prefix_sha256", "source_record_sha256"):
+                        if len(history[key]) != 64 or any(c not in "0123456789abcdef" for c in history[key]):
+                            raise ValueError("固定SFT经历摘要无效")
+                    if (
+                        history["case_id"] != record.case_id
+                        or history["rollout_id"] != record.parent_rollout_id
+                        or record.parent_rollout_id in ids
+                    ):
+                        raise ValueError("固定SFT经历错误绑定为当前动作")
+                else:
+                    required = {
+                        "rollout_id",
+                        "case_id",
+                        "policy_version",
+                        "manifest_sha256",
+                        "source_batch",
+                        "current_batch",
+                    }
+                    if set(history) != required or any(
+                        not isinstance(history[k], str) or not history[k]
+                        for k in ("rollout_id", "case_id", "policy_version", "manifest_sha256")
+                    ):
+                        raise ValueError("旧父经历缺少完整来源身份")
+                    if len(history["manifest_sha256"]) != 64 or any(
+                        c not in "0123456789abcdef" for c in history["manifest_sha256"]
+                    ):
+                        raise ValueError("旧父经历摘要无效")
+                    if (
+                        any(type(history[k]) is not int for k in ("source_batch", "current_batch"))
+                        or history["source_batch"] < 0
+                        or history["current_batch"] != history["source_batch"] + 1
+                    ):
+                        raise ValueError("旧经历须恰好来自上一采样批")
+                    if (
+                        history["case_id"] != record.case_id
+                        or history["rollout_id"] != record.parent_rollout_id
+                        or record.parent_rollout_id in ids
+                    ):
+                        raise ValueError("旧QA的case/父身份与来源不一致")
+                    try:
+                        old_source, old_step = history["policy_version"].rsplit("/update-", 1)
+                        new_source, new_step = record.policy_version.rsplit("/update-", 1)
+                        if old_source != new_source or not 0 <= int(old_step) <= int(new_step):
+                            raise ValueError("旧经历来自另一初始化或未来策略")
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError("旧经历策略版本不能与当前行为策略对齐") from exc
                 pair = record.paired_execution_group_id
                 if pair not in groups or records[groups[pair][0]].phase != "execution":
                     raise ValueError("旧QA缺少当前计算batch的配对动作组")

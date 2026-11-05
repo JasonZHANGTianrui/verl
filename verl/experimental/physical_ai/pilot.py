@@ -62,7 +62,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
 
     question = config["question"]
     history_mode = config.get("qa_history_mode", "current")
-    if history_mode not in {"current", "previous_batch"}:
+    if history_mode not in {"current", "previous_batch", "fixed_sft"}:
         raise ValueError("未知QA经历来源")
     if history_mode == "previous_batch" and (task is None or task.get("schema") == "physical-ai.generated-rl-task.v1"):
         raise ValueError("旧经历QA首版仅支持已核验的普通LIBERO示范初态任务")
@@ -234,6 +234,18 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 records.append(record)
                 artifacts.append(phase)
                 parents.append(parent)
+        if history_mode == "fixed_sft":
+            from .sft_replay import collect_qa
+
+            for parent in parents:
+                parent[0].close()
+            qa_records, qa_artifacts = collect_qa(
+                policy, processor, config, output, policy_version=policy_version, task=task, drive=drive
+            )
+            records.extend(qa_records)
+            artifacts.extend(qa_artifacts)
+            save_json(output / "groups.json", [asdict(r) for r in records])
+            return records, artifacts
         selected = select_parent(records, seed=config["seed"], mode="uniform")
         parent_index = next(i for i, r in enumerate(records) if r.rollout_id == selected)
         session, chat, phase, binding = parents[parent_index]

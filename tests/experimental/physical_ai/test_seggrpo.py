@@ -61,6 +61,55 @@ def fixture():
 class SegGRPOTests(unittest.TestCase):
     """针对分组、反向和选择偏置测试，而不是只验证字段名字。"""
 
+    def test_fixed_sft_parent_has_no_action_gradient_or_stale_policy_claim(self):
+        """固定SFT来源不是当前动作父轨迹，不伪造策略步数；只新QA参与更新。"""
+        from verl.experimental.physical_ai.sft_replay import prefix_inputs
+
+        records, mask = fixture()
+        history = dict(
+            kind="fixed_sft",
+            rollout_id="sft/sample",
+            case_id="case",
+            manifest_sha256="a" * 64,
+            prefix_sha256="b" * 64,
+            source_record_sha256="c" * 64,
+        )
+        records = [
+            replace(r, parent_rollout_id="sft/sample", history_parent=history, paired_execution_group_id="action-group")
+            if r.phase == "qa"
+            else r
+            for r in records
+        ]
+        rows = namespace_group(records, "task")
+        artifacts = [dict(generated=[False] + m.tolist(), old_logprobs=[0.0] + [-1.0] * len(m)) for m in mask]
+        prepared = prepare_batch(rows, artifacts)
+        self.assertFalse(bool(prepared["active"][2:, :4].any()))
+        self.assertEqual(rollout_metrics(rows, artifacts, prepared)["rollout/qa/fixed_sft_sequences"], 2)
+        self.assertNotIn("rollout/qa/history_update_age_mean", rollout_metrics(rows, artifacts, prepared))
+        with self.assertRaises(ValueError):
+            prepare_batch([replace(r, case_id="wrong") if r.phase == "qa" else r for r in rows], artifacts)
+        inputs = dict(
+            input_ids=torch.tensor([[1, 2, 3, 999, 888]]),
+            attention_mask=torch.tensor([[4] * 5]),
+            labels=torch.tensor([[-100, -100, -100, 999, 888]]),
+            pixel_values={},
+            proprio=torch.zeros(1, 0, 27),
+        )
+        audit = dict(
+            sample_id="sample",
+            segments=[
+                dict(start=0, end=3, message_id=None, attachment=None),
+                dict(start=3, end=5, message_id="answer", attachment=None),
+            ],
+        )
+        entry = dict(sft_id="sample", input_tokens=5, answer_cut=3, images=0, states=0)
+        actual = prefix_inputs(inputs, audit, entry)
+        self.assertEqual(actual["input_ids"].tolist(), [[1, 2, 3]])
+        self.assertNotIn("labels", actual)
+        self.assertEqual(inputs["input_ids"].shape[1], 5)
+        with self.assertRaises(ValueError):
+            prefix_inputs(inputs, audit, {**entry, "answer_cut": 4})
+
     def test_previous_batch_qa_keeps_old_parent_and_masks_old_actions(self):
         """旧QA可属于另一任务，但不能冒充当前父轨迹或再次监督历史动作。"""
         records, mask = fixture()

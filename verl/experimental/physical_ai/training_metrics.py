@@ -17,16 +17,23 @@ def rollout_metrics(records, artifacts, prepared):
     全部未知时不输出伪造的0准确率，明确输出scored_sequences=0和排除组数。
     """
     metrics = {}
-    histories = [r.history_parent for r in records if r.phase == "qa" and r.history_parent is not None]
+    histories = [
+        r.history_parent
+        for r in records
+        if r.phase == "qa" and r.history_parent is not None and r.history_parent.get("kind") != "fixed_sft"
+    ]
     if histories:
         ages = [
             int(r.policy_version.rsplit("/update-", 1)[1])
             - int(r.history_parent["policy_version"].rsplit("/update-", 1)[1])
             for r in records
-            if r.history_parent is not None
+            if r.history_parent is not None and r.history_parent.get("kind") != "fixed_sft"
         ]
         metrics["rollout/qa/history_update_age_mean"] = sum(ages) / len(ages)
         metrics["rollout/qa/history_update_age_max"] = max(ages)
+    metrics["rollout/qa/fixed_sft_sequences"] = sum(
+        r.history_parent is not None and r.history_parent.get("kind") == "fixed_sft" for r in records
+    )
     metrics["rollout/qa/stale_history_sequences"] = len(histories)
     for phase in ("execution", "qa"):
         all_ids = [i for i, r in enumerate(records) if r.phase == phase]

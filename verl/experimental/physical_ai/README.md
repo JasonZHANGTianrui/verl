@@ -424,3 +424,20 @@ verifies preparation, controller/sensor/physical state, images and GT before QA.
 The checkpoint's previous-batch directory must remain available for resuming.
 The history distribution is stale; this is not stale-answer PPO. Histories and
 current optimizer grouping have separate identities. Ordinary GRPO is unchanged.
+
+### Fixed SFT QA Replay
+
+`qa_history_mode: fixed_sft` uses a content-bound index produced by
+`data-pipeline/ours/rl/export_replay.py`. Bind its directory with
+`qa_replay_release`, its manifest hash with `qa_replay_manifest_sha256`, and set
+`qa_action_policy: ignore`. Execution groups remain online; QA uses the matching
+frozen SFT experience, its own question and mechanical GT, independently of the
+current action result. Historical assistant actions are context, not new targets.
+
+The cached sequence is cut at the start of the original final assistant answer;
+labels, the old answer and its reasoning never enter the model. All earlier native
+modalities remain. Each QA branch generates one native assistant response; tool
+calls are logged but never executed and do not receive an extra penalty. Public
+text is scored through the existing judge. Current generated IDs/logprobs, including
+ignored tool syntax, are preserved, and only this new QA response receives its
+QA advantage. No simulator or synthetic tool response is used for offline QA.
