@@ -153,11 +153,12 @@ def main():
         max_groups = training_budget(config, tasks_per_batch)
         save_freq = config.get("save_freq", 1)
         recovery_save_freq = config.get("recovery_save_freq")
+        model_save_batches = config.get("model_save_batches")
         keep = config.get("max_ckpt_to_keep")
         retain_models = config.get("retain_model_snapshots", False)
         if type(retain_models) is not bool:
             raise ValueError("retain_model_snapshots必须为布尔值")
-        checkpoint_plan(1, save_freq, recovery_save_freq)
+        checkpoint_plan(1, save_freq, recovery_save_freq, model_save_batches=model_save_batches)
         if keep is not None and (type(keep) is not int or keep < 1):
             raise ValueError("max_ckpt_to_keep须为正整数或null")
         if args.stop_after_groups and args.stop_after_groups % tasks_per_batch:
@@ -555,7 +556,11 @@ def main():
                     save_json(directory / f"mini-{mini_index:02d}/summary.json", dict(metrics=metrics, update=result))
             completed_now = group_index + tasks_per_batch
             should_save, model_due = checkpoint_plan(
-                batch_index + 1, save_freq, recovery_save_freq, final=completed_now == last_group
+                batch_index + 1,
+                save_freq,
+                recovery_save_freq,
+                final=completed_now == last_group,
+                model_save_batches=model_save_batches,
             )
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()

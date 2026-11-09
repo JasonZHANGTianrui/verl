@@ -84,14 +84,24 @@ def checkpoint_due(completed_batches, save_freq, *, final=False):
     return final or completed_batches % save_freq == 0
 
 
-def checkpoint_plan(completed_batches, save_freq, recovery_save_freq=None, *, final=False):
+def checkpoint_plan(completed_batches, save_freq, recovery_save_freq=None, *, final=False, model_save_batches=None):
     """分别决定恢复存档与测评快照；频率单位均为完整采样批，默认保持历史行为。
 
     save_freq控制测评模型快照；可选recovery_save_freq只增加完整恢复存档，不增加
     测评权重。模型快照仍依赖同一次完整保存，因此返回(save_full, save_model)。
+    model_save_batches可显式指定模型保存批次，替代模型周期；须为严格递增的正整数列表。
     final保存两者；prune仍只管理完整恢复存档的latest，不清理独立模型快照。
     """
     model_due = checkpoint_due(completed_batches, save_freq, final=final)
+    if model_save_batches is not None:
+        if (
+            not isinstance(model_save_batches, list)
+            or not model_save_batches
+            or any(type(value) is not int or value < 1 for value in model_save_batches)
+            or model_save_batches != sorted(set(model_save_batches))
+        ):
+            raise ValueError("模型保存批次须为非空、严格递增的正整数列表")
+        model_due = final or completed_batches in model_save_batches
     recovery_due = checkpoint_due(
         completed_batches, save_freq if recovery_save_freq is None else recovery_save_freq, final=final
     )

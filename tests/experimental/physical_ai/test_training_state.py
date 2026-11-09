@@ -181,6 +181,19 @@ class TrainingStateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 checkpoint_plan(20, 20, value)
 
+    def test_explicit_model_batches_preserve_recovery_schedule(self):
+        """20/30/40模型快照与5批恢复独立；包括断点后31起算和最后一批。"""
+        schedule = [checkpoint_plan(i, 20, 5, model_save_batches=[20, 30, 40]) for i in range(1, 41)]
+        self.assertEqual([i + 1 for i, (full, _) in enumerate(schedule) if full], list(range(5, 41, 5)))
+        self.assertEqual([i + 1 for i, (_, model) in enumerate(schedule) if model], [20, 30, 40])
+        self.assertEqual(
+            [i for i in range(31, 41) if checkpoint_plan(i, 20, 5, model_save_batches=[20, 30, 40])[1]], [40]
+        )
+        self.assertEqual(checkpoint_plan(7, 20, 5, final=True, model_save_batches=[20, 30, 40]), (True, True))
+        for value in [[], [0], [True], [1.5], [20, 20], [30, 20], "20,30,40"]:
+            with self.assertRaises(ValueError):
+                checkpoint_plan(1, 20, 5, model_save_batches=value)
+
     def test_generation_timeout_recovery_preserves_training_contract(self):
         """基础设施超时只可有限延长；不能夹带预算、奖励、拓扑、数据或模型修改。"""
         from copy import deepcopy
