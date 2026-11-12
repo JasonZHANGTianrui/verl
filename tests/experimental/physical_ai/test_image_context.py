@@ -73,6 +73,30 @@ class ImageContextTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             join_phase_windows(action, wrong)
 
+    def test_seggrpo_window2_qa_masks_parent_actions(self):
+        """SegGRPO的QA证书只含新生成；父动作仍在前缀中，但不重复形成QA梯度。"""
+        inputs, _, mask, calls = fixture()
+        for turn, call in enumerate(calls):
+            call["visual_history"]["omitted_turns"] = omitted_turns(turn + 1, 2)
+        split = 13
+        boundary = calls[split]["original_input_tokens"]
+        qa_mask = mask.clone()
+        qa_mask[:, : boundary - 1] = False
+        original_ids = inputs["input_ids"].clone()
+        certificate = SamplingWindow(2, Tokenizer()).certificate(inputs, calls[split:])
+        seen = []
+        for actual, indices, active in context_views(inputs, dict(context_window=certificate), qa_mask):
+            seen.extend(indices[active[0]].tolist())
+            self.assertEqual(len(actual["pixel_values"]), 2)
+            self.assertTrue(torch.equal(actual["proprio"], inputs["proprio"][:, : actual["proprio"].shape[1]]))
+        self.assertEqual(sorted(seen), torch.where(qa_mask[0])[0].tolist())
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertTrue(all(index >= boundary - 1 for index in seen))
+        self.assertTrue(torch.equal(inputs["input_ids"], original_ids))
+        # 误把父动作也交给QA证书，必须拒绝，不能默默漏掉或重复监督。
+        with self.assertRaises(ValueError):
+            list(context_views(inputs, dict(context_window=certificate), mask))
+
     def test_window_views_cover_original_tokens_once(self):
         """动作下标不能随删图偏移；state/文字逐值保留，不把图片标记误删。"""
         inputs, artifact, mask, _ = fixture()

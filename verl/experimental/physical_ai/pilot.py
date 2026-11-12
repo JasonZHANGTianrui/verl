@@ -33,7 +33,9 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
 
     output为新的组目录，config已绑定一道训练任务/原问题与独立动作奖励。
     每个控制步采集真实图；均匀选择父经历后建立独立QA环境副本。返回Segment及
-    原始token/mask/概率附件索引；未知GT或judge错误整组抛错，不丢样本缩组。
+    原始token/mask/概率附件索引；未知GT按配置整组排除QA更新，judge错误报错。
+    可选max_image_turn同时传给动作与QA；保留完整父经历作审计，模型输入由窗口投影，
+    QA更新只覆盖新回答的窗口证书，父动作仍由独立动作组负责监督。
     """
     from benchmark.adapters.libero_scene_map import LiberoSceneMap
     from benchmark.core.scene_graph import SceneRecorder
@@ -170,6 +172,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                 max_calls=config.get("execution_max_calls"),
                 per_message_budget=config.get("execution_token_scope") == "message",
                 timeout_seconds=config.get("generation_timeout_seconds", 180),
+                max_image_turn=config.get("max_image_turn"),
             )
             # 训练任务的QA原封不动复用；动作奖励读独立目标，不能把QA答案当任务完成。
             task_result = (
@@ -289,6 +292,7 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
                     old_logprobs=phase["old_logprobs"],
                     max_calls=config.get("qa_max_calls"),
                     timeout_seconds=config.get("generation_timeout_seconds", 180),
+                    max_image_turn=config.get("max_image_turn"),
                 )
                 judgment = score_answer(binding, answer["answer"], client, rollout_id=selected)
                 save_json(directory / "judge.json", judgment)

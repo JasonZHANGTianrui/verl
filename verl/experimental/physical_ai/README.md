@@ -427,3 +427,7 @@ once, and each window's loss is weighted by its token count over the complete
 trajectory. Using only the final QA window would silently discard action training
 and is rejected by coverage validation. Task-only trajectories retain the action
 certificate. QA capacity checks use the projected input, not the archived full log.
+
+SegGRPO同样支持`max_image_turn`：动作组和所选父经历后的QA分叉均使用窗口投影，
+文字/动作/state前缀保留。每阶段各自记录窗口证书，QA只对新回答计算梯度；
+不将普通GRPO的整轨迹奖励或动作—QA证书拼接规则搬入阶段独立优势。
