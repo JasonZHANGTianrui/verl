@@ -40,6 +40,15 @@ def resolve_algorithm(config):
             batching.prepare_batch,
             training_metrics.rollout_metrics,
         )
+    if name == "qa_replay_grpo":
+        from . import qa_replay, training_metrics
+
+        qa_replay.validate_config(config)
+        return Algorithm(
+            name, config["qa_group_size"], qa_replay.validate_config, qa_replay.collect_group,
+            qa_replay.namespace_group, qa_replay.task_groups, qa_replay.minibatch_indices,
+            qa_replay.prepare_batch, training_metrics.rollout_metrics,
+        )
     if name == "grpo":
         from . import grpo
         from .grpo_rollout import collect_group

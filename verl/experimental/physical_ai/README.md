@@ -441,3 +441,20 @@ calls are logged but never executed and do not receive an extra penalty. Public
 text is scored through the existing judge. Current generated IDs/logprobs, including
 ignored tool syntax, are preserved, and only this new QA response receives its
 QA advantage. No simulator or synthetic tool response is used for offline QA.
+
+### 仅QA的固定经历Replay
+
+`advantage_estimator=qa_replay_grpo`使用`qa_replay.py`独立装配：固定SFT完整前缀上
+生成`qa_group_size`条回答，仅QA的0/1奖励做组内GRPO；不调用在线动作采集、不建
+模拟器、不计算动作loss。原SegGRPO和在线动作＋Replay QA路径保持不变。
+
+配置须为`qa_history_mode=fixed_sft`、`qa_action_policy=ignore`及
+`unknown_qa_policy=skip_qa_group`；禁止`execution_group_size`、`parent_selection`
+和`execution_loss_weight`。未知GT整组保留真实采样/概率核验，不计奖励和梯度。
+历史动作/观察/任务结束语仅作条件，监督mask仅覆盖本次新回答；新生成的工具输出
+只记录、不执行，普通正文交原judge。复用相同索引/原生聊天格式/冻结经历GT。
+
+例如64/16/n8对应每批8道题、每mini2道题，最多4次更新。`total_training_steps=40`
+是40个采样batch；沿原FP32 Torch/SDPA训练计算与真实行为概率校验，不把SFT交接的
+FLA加载建议冒称本轮训练后端。新源权重须独立记录SHA、核对codec/tokenizer/state
+统计以及完整QA前缀身份，不能接续旧Replay权重或优化器。
