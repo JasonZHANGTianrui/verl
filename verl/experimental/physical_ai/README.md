@@ -458,3 +458,15 @@ QA advantage. No simulator or synthetic tool response is used for offline QA.
 是40个采样batch；沿原FP32 Torch/SDPA训练计算与真实行为概率校验，不把SFT交接的
 FLA加载建议冒称本轮训练后端。新源权重须独立记录SHA、核对codec/tokenizer/state
 统计以及完整QA前缀身份，不能接续旧Replay权重或优化器。
+
+### 仅动作阶段GRPO
+
+`advantage_estimator=action_grpo`由`action_grpo.py`装配，复用普通GRPO的原生闭环
+执行器、完整组优势/更新/恢复；强制`question=None,qa_steps=0`，不拼接QA、不查询
+QA GT、不创建judge客户端。奖励是原动作终点任务成功0/1，权重100%。动作调用与
+动作阶段生成的自主结束正文共同参与任务奖励；图像/state/tool反馈仍不监督。
+
+不允许QA组、Replay池或动作/QA阶段配对配置。原任务表中的followup保留为来源
+记录，不交给模型。普通GRPO、SegGRPO、QA-only Replay的算法和奖励保持原样。
+64/16/n8对应每批8个初态任务、每mini2个任务；冻结初态/dummy/预算/成功判据，
+初始化权重和保存策略由独立运行配置指定。

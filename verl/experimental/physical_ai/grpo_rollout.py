@@ -47,7 +47,11 @@ def collect_group(policy, processor, config, output, *, policy_version, task=Non
     first_preparation = None
     condition = None
     finished = 0
-    client = JudgeClient(Path(os.environ["PHYSICAL_AI_JUDGE_ACCESS_FILE"]), model=config["judge_model"], timeout_s=90)
+    # 无QA的动作专用组不读取API凭据，也不创建judge客户端。
+    client = (
+        JudgeClient(Path(os.environ["PHYSICAL_AI_JUDGE_ACCESS_FILE"]), model=config["judge_model"], timeout_s=90)
+        if question is not None else None
+    )
 
     def trajectory(i):
         """一条独立动作→QA经历；生成边界yield给公共batch调度器，共享权重但不共享会话。"""

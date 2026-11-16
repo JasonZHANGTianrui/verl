@@ -49,6 +49,15 @@ def resolve_algorithm(config):
             qa_replay.namespace_group, qa_replay.task_groups, qa_replay.minibatch_indices,
             qa_replay.prepare_batch, training_metrics.rollout_metrics,
         )
+    if name == "action_grpo":
+        from . import action_grpo, grpo
+
+        action_grpo.validate_config(config)
+        return Algorithm(
+            name, config["group_size"], action_grpo.validate_config, action_grpo.collect_group,
+            grpo.namespace_group, grpo.task_groups, grpo.minibatch_indices,
+            grpo.prepare_batch, grpo.rollout_metrics,
+        )
     if name == "grpo":
         from . import grpo
         from .grpo_rollout import collect_group
